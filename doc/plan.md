@@ -332,6 +332,8 @@ gantt
 
 ## 10. 要請你決定的事
 
+**決定（2026-11-25）：五項都照建議。** ext4 完整讀寫加 jbd2；籠子分兩步（M6 用 `auto`，M8 改回 `on`）；RISC-V 驗證到 M5、不做 riscv64 系統碟（沒有 M9）；`--kernel ruxos` 用 `root=` 直接開機；MIT 授權。
+
 1. **資料碟的 ext4**：
    * **(建議) 完整的 ext4 讀寫加 jbd2 日誌**，磁碟格式不變，Linux 與 ruxos 可以輪流開同一個資料碟。工作量最大的一塊（M4）。
    * 或：ruwebos 的 init 改用沒有日誌的 ext4 格式化資料碟（`mkfs.ext4 -O ^has_journal`），ruxos 只寫沒有日誌的 ext4。省下 jbd2，但當機後要靠 `e2fsck`，且現有的資料碟要轉換。
