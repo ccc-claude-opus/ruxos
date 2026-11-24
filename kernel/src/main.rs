@@ -8,20 +8,34 @@ extern crate alloc;
 #[macro_use]
 mod console;
 mod arch;
+mod block;
+mod errno;
 mod fdt;
+mod fs;
+mod futex;
 mod irq;
+mod locks;
 mod mm;
 mod percpu;
 mod power;
+mod random;
 mod sched;
 mod selftest;
 mod sync;
+mod syscall;
 mod task;
 mod time;
 mod trap;
+mod tty;
+mod vdso;
+mod vfs;
 
 use core::panic::PanicInfo;
 use core::sync::atomic::Ordering;
+
+/// uname: the Linux ABI level ruxos implements, and its own version.
+pub const RELEASE: &str = concat!("6.12.0-ruxos-", env!("CARGO_PKG_VERSION"));
+pub const VERSION: &str = concat!("#1 SMP ruxos ", env!("CARGO_PKG_VERSION"));
 
 /// The device tree (virtual address in the linear map).
 pub static FDT: sync::Once<fdt::Fdt<'static>> = sync::Once::new();
@@ -63,9 +77,9 @@ pub extern "C" fn kmain(dtb_pa: usize, hart: usize) -> ! {
     let pc0 = percpu::cpu(0);
     sched::init_cpu_idle(pc0, false);
     pc0.online.store(true, Ordering::Relaxed);
+    arch::timer_init(&fdt);
     time::init();
     time::rtc_init(&fdt);
-    arch::timer_init(&fdt);
     arch::irq_init(&fdt);
     if !quiet {
         println!(
@@ -125,14 +139,100 @@ pub extern "C" fn secondary_main(cpu: usize, _hart: usize) -> ! {
     sched::idle_loop();
 }
 
-/// The first kernel thread: brings up the rest of the system.
+/// The first kernel thread: brings up the rest of the system and becomes init.
 extern "C" fn kernel_init(_: usize) {
     if let Some(t) = kernel_param("ruxos.test") {
         selftest::run(t);
         power::poweroff(&FDT);
     }
-    println!("ruxos: nothing to run yet");
-    power::poweroff(&FDT);
+    let fdt = *FDT;
+    random::init(&fdt);
+    vfs::dev::init();
+    tty::init(&fdt);
+    vdso::init();
+
+    // the root file system: the initramfs in a tmpfs, else root=
+    let (root_mnt, init_path) = if let Some((s, e)) = fdt.initrd().filter(|r| r.1 > r.0) {
+        let fs = vfs::tmpfs::TmpFs::new("rootfs", 0o755);
+        let m = vfs::Mount::new(vfs::path::DEntry::new_root(fs), 0, "rootfs", "rootfs", "");
+        let root = vfs::PathRef { mnt: m.clone(), d: m.root.clone() };
+        let data = unsafe { core::slice::from_raw_parts(arch::phys_to_virt(s) as *const u8, e - s) };
+        match vfs::cpio::unpack(data, &root) {
+            Ok(n) => {
+                if kernel_param("quiet").is_none() {
+                    println!("ruxos: initramfs: {} entries", n);
+                }
+            }
+            Err(e) => println!("ruxos: initramfs: cannot unpack ({:?})", e),
+        }
+        mm::frame::free_range(s, e);
+        (m, kernel_param("rdinit").unwrap_or("/init"))
+    } else {
+        match fs::mount_root() {
+            Ok(m) => (m, kernel_param("init").unwrap_or("/sbin/init")),
+            Err(e) => panic!("cannot mount the root file system ({:?})", e),
+        }
+    };
+    let root = vfs::PathRef { mnt: root_mnt.clone(), d: root_mnt.root.clone() };
+    task::make_init(root);
+    if kernel_param("ruxos.strace").is_some() {
+        syscall::STRACE.store(true, Ordering::Relaxed);
+    }
+
+    // fds 0, 1, 2: /dev/console
+    let console = syscall::fs::open_path(-100, b"/dev/console", vfs::file::O_RDWR, 0).or_else(|_| {
+        let i = vfs::FileSystem::root(&**vfs::dev::DEVTMPFS).lookup(b"console")?;
+        Ok::<_, errno::Errno>(vfs::File::with_node(vfs::file::ops_for(&i, vfs::file::O_RDWR)?, vfs::file::O_RDWR, None, Some(i)))
+    });
+    match console {
+        Ok(c) => {
+            let th = task::current_thread();
+            let mut fds = th.files.lock();
+            for _ in 0..3 {
+                let _ = fds.alloc(c.clone(), 0, false);
+            }
+        }
+        Err(_) => println!("ruxos: warning: unable to open an initial console"),
+    }
+
+    // run init with a trap frame at the top of this thread's kernel stack
+    let me = sched::current();
+    let fptr = (me.kstack_top() - core::mem::size_of::<arch::TrapFrame>()) as *mut arch::TrapFrame;
+    let mut frame = arch::new_user_frame(0, 0);
+    let (argv, envp) = init_args(init_path);
+    let cwd = task::current_thread().fs.lock().cwd.clone();
+    if let Err(e) = task::exec::execve(init_path.as_bytes(), argv, envp, &cwd, &mut frame) {
+        panic!("cannot run {} ({:?})", init_path, e);
+    }
+    unsafe { *fptr = frame };
+    task::own().frame = fptr;
+    task::enter_user(fptr);
+}
+
+/// Like Linux (init/main.c): kernel parameters the kernel does not know go to init, `name=value`
+/// ones as environment variables and the others as arguments; names with a '.' are module
+/// parameters and are not passed.
+fn init_args(init: &str) -> (alloc::vec::Vec<alloc::vec::Vec<u8>>, alloc::vec::Vec<alloc::vec::Vec<u8>>) {
+    const KNOWN: &[&str] = &["console", "root", "rootfstype", "rootflags", "rootwait", "rw", "ro", "init", "rdinit", "quiet", "loglevel", "debug", "earlycon", "panic"];
+    let mut argv = alloc::vec![init.as_bytes().to_vec()];
+    let mut envp = alloc::vec![b"HOME=/".to_vec(), b"TERM=linux".to_vec()];
+    let mut after_dashes = false;
+    for a in CMDLINE.get().copied().unwrap_or("").split_whitespace() {
+        if a == "--" {
+            after_dashes = true;
+            continue;
+        }
+        let name = a.split('=').next().unwrap_or(a);
+        if !after_dashes && (KNOWN.contains(&name) || name.contains('.')) {
+            continue;
+        }
+        if !after_dashes && a.contains('=') {
+            envp.push(a.as_bytes().to_vec());
+        } else {
+            argv.push(a.as_bytes().to_vec());
+        }
+    }
+    (argv, envp)
 }
 
 #[panic_handler]

@@ -84,3 +84,7 @@ macro_rules! println {
     () => (print!("\n"));
     ($($arg:tt)*) => ($crate::console::print(format_args!("{}\n", format_args!($($arg)*))));
 }
+
+pub fn uart_shift() -> usize {
+    SHIFT.load(Ordering::Relaxed)
+}

@@ -13,15 +13,25 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub const SLICE_NS: u64 = 4_000_000;
 
 pub fn init() {
-    FREQ.store(arch::tick_freq(), Ordering::Relaxed);
+    let f = arch::tick_freq();
+    FREQ.store(f, Ordering::Relaxed);
+    MULT.store(((1_000_000_000u128 << 32) / f as u128) as u64, Ordering::Relaxed);
+}
+
+/// Publishes the clock parameters to the vDSO.
+pub fn publish() {
+    crate::vdso::update(MULT.load(Ordering::Relaxed), REALTIME_OFFSET.load(Ordering::Relaxed));
 }
 
 pub fn freq() -> u64 {
     FREQ.load(Ordering::Relaxed)
 }
 
+/// ns = (ticks * MULT) >> 32, the same arithmetic as the vDSO (so the two never disagree).
+static MULT: AtomicU64 = AtomicU64::new(1 << 32);
+
 pub fn ticks_to_ns(t: u64) -> u64 {
-    ((t as u128 * 1_000_000_000) / freq() as u128) as u64
+    ((t as u128 * MULT.load(Ordering::Relaxed) as u128) >> 32) as u64
 }
 
 pub fn ns_to_ticks(ns: u64) -> u64 {
@@ -39,6 +49,7 @@ pub fn realtime_ns() -> i64 {
 
 pub fn set_realtime_ns(ns: i64) {
     REALTIME_OFFSET.store(ns - monotonic_ns() as i64, Ordering::Relaxed);
+    publish();
 }
 
 pub type TimerId = (usize, (u64, u64));

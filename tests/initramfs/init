@@ -1,0 +1,30 @@
+#!/bin/busybox sh
+# ruxos's user-space smoke test (busybox): processes, pipes, files, signals, time, memory.
+/bin/busybox --install -s /bin
+[ -n "$shell" ] && exec /bin/sh
+export PATH=/bin
+mount -t devtmpfs devtmpfs /dev
+mount -t tmpfs tmpfs /tmp
+fail() { echo "ruxos-test m2: FAIL $*"; poweroff -f; }
+t0=$(date +%s); sleep 1; t1=$(date +%s)
+[ $((t1 - t0)) -ge 1 ] && [ $((t1 - t0)) -le 2 ] || fail sleep
+mkdir -p /tmp/a/b && echo hello > /tmp/a/b/f && [ "$(cat /tmp/a/b/f)" = hello ] || fail files
+ln -s /tmp/a/b/f /tmp/link && [ "$(cat /tmp/link)" = hello ] || fail symlink
+mv /tmp/a/b/f /tmp/a/g && [ -f /tmp/a/g ] && [ ! -e /tmp/a/b/f ] || fail rename
+rm -r /tmp/a && [ ! -e /tmp/a ] || fail rm
+(exit 3); [ $? = 3 ] || fail exit-status
+[ "$(echo abc | tr a-z A-Z)" = ABC ] || fail pipe
+[ "$(seq 1 1000 | sort -rn | head -1)" = 1000 ] || fail sort
+n=0; for i in 1 2 3 4 5 6 7 8; do (sleep 0.1; exit $i) & done; wait; echo "background jobs done"
+trap 'got=1' USR1; got=0; kill -USR1 $$; [ $got = 1 ] || fail signal
+[ "$(dd if=/dev/zero bs=65536 count=256 2>/dev/null | wc -c)" = 16777216 ] || fail dd
+x=$(md5sum /bin/busybox) || fail md5sum
+echo 'a=1; b=2; echo $((a+b))' > /tmp/s.sh; [ "$(sh /tmp/s.sh)" = 3 ] || fail script
+printf '#!/bin/sh\necho shebang $1\n' > /tmp/sb; chmod +x /tmp/sb; [ "$(/tmp/sb x)" = "shebang x" ] || fail shebang
+cd /tmp && [ "$(pwd)" = /tmp ] || fail cwd
+/bin/abi > /tmp/abi.out 2>&1
+grep -v '^ok' /tmp/abi.out
+grep -q '^abi: 0 failures' /tmp/abi.out || fail abi
+uname -a
+echo "ruxos-test m2: ok"
+poweroff -f

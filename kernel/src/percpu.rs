@@ -31,6 +31,8 @@ pub struct PerCpu {
     pub timers: SpinLock<BTreeMap<(u64, u64), Arc<Task>>>,
     /// Ticks at which the time slice of the running task ends (0 = none).
     pub slice_end: UnsafeCell<u64>,
+    /// Id of the user address space loaded in this CPU (0 = none).
+    pub loaded_mm: core::sync::atomic::AtomicU64,
 }
 
 unsafe impl Sync for PerCpu {}
@@ -50,6 +52,7 @@ const INIT: PerCpu = PerCpu {
     rq: SpinLock::new(VecDeque::new()),
     timers: SpinLock::new(BTreeMap::new()),
     slice_end: UnsafeCell::new(0),
+    loaded_mm: core::sync::atomic::AtomicU64::new(0),
 };
 
 static mut CPUS: [PerCpu; MAX_CPUS] = [INIT; MAX_CPUS];

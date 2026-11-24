@@ -5,7 +5,7 @@ use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 pub const PAGE_SIZE: usize = 4096;
-pub const MAX_ORDER: usize = 10; // 4 MB blocks
+pub const MAX_ORDER: usize = 13; // 32 MB blocks
 
 #[repr(C)]
 pub struct PageMeta {
@@ -110,7 +110,11 @@ pub fn init(ram: (usize, usize), reserved: &[(usize, usize)]) {
     // the PageMeta array goes in the first free spot after the kernel image
     let meta_bytes = (pages * core::mem::size_of::<PageMeta>() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let kernel_end = virt_to_phys(unsafe { &crate::arch::_end as *const u8 as usize });
-    let meta_pa = (kernel_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    // the first spot after the kernel that overlaps no reserved range (initrd, device tree)
+    let mut meta_pa = (kernel_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    while let Some(&(_, e)) = reserved.iter().find(|&&(s, e)| e > s && meta_pa < e && s < meta_pa + meta_bytes) {
+        meta_pa = (e + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    }
     unsafe {
         RAM_START = start;
         RAM_PAGES = pages;
@@ -121,7 +125,8 @@ pub fn init(ram: (usize, usize), reserved: &[(usize, usize)]) {
         }
     }
     let busy = |pa: usize| -> bool {
-        pa < meta_pa + meta_bytes // RAM below the kernel, the kernel, the PageMeta array
+        pa < kernel_end // RAM below the kernel, and the kernel
+            || (pa >= meta_pa && pa < meta_pa + meta_bytes)
             || reserved.iter().any(|&(s, e)| pa + PAGE_SIZE > s && pa < e)
     };
     let mut b = BUDDY.lock();
@@ -190,4 +195,14 @@ pub fn page_refs(pa: usize) -> u32 {
 
 pub fn free_count() -> usize {
     BUDDY.lock().free_pages
+}
+
+/// Gives a reserved physical range (the initrd once unpacked) to the allocator.
+pub fn free_range(start: usize, end: usize) {
+    let mut pa = (start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    while pa + PAGE_SIZE <= end {
+        BUDDY.lock().free(pa, 0);
+        pa += PAGE_SIZE;
+    }
+    TOTAL_PAGES.fetch_add((end - start) / PAGE_SIZE, Ordering::Relaxed);
 }

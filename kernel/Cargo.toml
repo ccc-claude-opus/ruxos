@@ -12,3 +12,4 @@ test = false
 bench = false
 
 [dependencies]
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }

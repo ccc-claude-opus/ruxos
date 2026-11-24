@@ -127,6 +127,7 @@ bad_exception:
 // Returns to EL0 from the trap frame at sp (also how a new user thread starts).
 .global ret_to_user
 ret_to_user:
+    msr     daifset, #0xf
     RESTORE
     eret
 

@@ -4,6 +4,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 core::arch::global_asm!(include_str!("boot.S"), options(raw));
 core::arch::global_asm!(include_str!("entry.S"), options(raw));
+core::arch::global_asm!(include_str!("vdso.S"), options(raw));
 
 pub mod plic;
 
@@ -126,6 +127,7 @@ pub fn cpu_init(percpu: usize) {
         asm!("csrw stvec, {}", in(reg) trap_entry as *const () as usize);
         asm!("csrs sie, {}", in(reg) (1usize << 9) | (1 << 5) | (1 << 1));
         asm!("csrs sstatus, {}", in(reg) 1usize << 13);
+        asm!("csrw scounteren, {}", in(reg) 2usize); // user mode may read the time CSR (rdtime, vDSO)
     }
     stop_timer();
 }
@@ -278,3 +280,268 @@ extern "C" fn trap_user(f: &mut TrapFrame) -> ! {
         asm!("mv sp, {}", "j ret_to_user", in(reg) f as *mut TrapFrame, options(noreturn));
     }
 }
+
+// ---- user page tables (Sv39: 3 levels; the kernel half of every root is the boot table's)
+
+pub const PT_LEVELS: usize = 3;
+pub const USER_TOP: usize = 1 << 38;
+const V: usize = 1;
+const R: usize = 2;
+const W: usize = 4;
+const X: usize = 8;
+const U: usize = 16;
+const A: usize = 64;
+const D: usize = 128;
+
+unsafe extern "C" {
+    static boot_root: [usize; 512];
+}
+
+pub fn pte_table(pa: usize) -> usize {
+    ((pa >> 12) << 10) | V
+}
+pub fn pte_valid(pte: usize) -> bool {
+    pte & V != 0
+}
+pub fn pte_pa(pte: usize) -> usize {
+    ((pte >> 10) & ((1 << 44) - 1)) << 12
+}
+/// A user page: `r` false = no user access at all (PROT_NONE: no U bit).
+pub fn pte_user(pa: usize, r: bool, w: bool, x: bool) -> usize {
+    let mut p = ((pa >> 12) << 10) | V | R | A | D;
+    if r {
+        p |= U;
+        if w {
+            p |= W;
+        }
+        if x {
+            p |= X;
+        }
+    }
+    p
+}
+pub fn pte_user_writable(pte: usize) -> bool {
+    pte & (U | W) == U | W
+}
+pub fn pte_user_readable(pte: usize) -> bool {
+    pte & U != 0
+}
+
+static ASID_BITS: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// ASIDLEN: write all ones to satp.ASID and read back (privileged spec 4.1.11).
+pub fn asid_bits() -> usize {
+    let b = ASID_BITS.load(Ordering::Relaxed);
+    if b != usize::MAX {
+        return b;
+    }
+    let old: usize;
+    let new: usize;
+    unsafe {
+        asm!("csrr {0}, satp", out(reg) old);
+        asm!("csrw satp, {0}", in(reg) old | (0xffff << 44));
+        asm!("csrr {0}, satp", out(reg) new);
+        asm!("csrw satp, {0}", "sfence.vma", in(reg) old);
+    }
+    let bits = ((new >> 44) & 0xffff).count_ones() as usize;
+    ASID_BITS.store(bits, Ordering::Relaxed);
+    bits
+}
+
+pub fn pt_sync() {
+    unsafe { asm!("fence rw, rw", options(nostack)) };
+}
+
+fn other_harts_mask() -> (usize, usize) {
+    (usize::MAX, 0) // all harts (hart_mask_base = 0 with mask all ones)
+}
+
+pub fn tlb_flush_page(asid: usize, va: usize) {
+    unsafe { asm!("sfence.vma {}, {}", in(reg) va, in(reg) asid, options(nostack)) };
+    if crate::percpu::ncpus() > 1 {
+        let (m, b) = other_harts_mask();
+        sbi_call6(0x5246_4e43, 2, m, b, va & !0xfff, 4096, asid);
+    }
+}
+pub fn tlb_flush_asid(asid: usize) {
+    unsafe { asm!("sfence.vma zero, {}", in(reg) asid, options(nostack)) };
+    if crate::percpu::ncpus() > 1 {
+        let (m, b) = other_harts_mask();
+        sbi_call6(0x5246_4e43, 2, m, b, 0, usize::MAX, asid);
+    }
+}
+/// A spurious fault: drop this hart's cached (invalid) translation.
+pub fn tlb_local_page(asid: usize, va: usize) {
+    unsafe { asm!("sfence.vma {}, {}", in(reg) va, in(reg) asid, options(nostack)) };
+}
+
+fn sbi_call6(eid: usize, fid: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize) {
+    unsafe {
+        asm!("ecall", inout("a0") a0 => _, inout("a1") a1 => _, in("a2") a2, in("a3") a3, in("a4") a4,
+             in("a6") fid, in("a7") eid, options(nostack));
+    }
+}
+
+pub fn activate_mm(root: usize, asid: usize) {
+    let satp = (8usize << 60) | (asid << 44) | (root >> 12);
+    unsafe { asm!("csrw satp, {}", in(reg) satp, options(nostack)) };
+    if asid_bits() == 0 {
+        unsafe { asm!("sfence.vma", options(nostack)) };
+    }
+}
+
+/// The kernel half (entries 256..511) of a new user root table.
+pub fn init_user_root(root_va: usize) {
+    let r = unsafe { core::slice::from_raw_parts_mut(root_va as *mut usize, 512) };
+    let boot = unsafe { &*(&raw const boot_root) };
+    r[256..].copy_from_slice(&boot[256..]);
+}
+
+pub fn read_tls() -> usize {
+    0 // tp is part of the trap frame
+}
+pub fn write_tls(_v: usize) {}
+
+pub fn sync_icache(_va: usize, _len: usize) {
+    unsafe { asm!("fence.i", options(nostack)) };
+    if crate::percpu::ncpus() > 1 {
+        sbi_call6(0x5246_4e43, 0, usize::MAX, 0, 0, 0, 0); // remote fence.i
+    }
+}
+
+// ---- user mode: system calls, new threads, signal frames
+
+pub fn syscall_nr(f: &TrapFrame) -> usize {
+    f.x[17]
+}
+pub fn syscall_args(f: &TrapFrame) -> [usize; 6] {
+    [f.x[10], f.x[11], f.x[12], f.x[13], f.x[14], f.x[15]]
+}
+pub fn syscall_ret(f: &TrapFrame) -> usize {
+    f.x[10]
+}
+pub fn set_syscall_ret(f: &mut TrapFrame, v: usize) {
+    f.x[10] = v;
+}
+/// Back to the `ecall` (pc was advanced past it) with the original first argument.
+pub fn restart_syscall(f: &mut TrapFrame, orig0: usize) {
+    f.x[10] = orig0;
+    f.pc -= 4;
+}
+pub fn frame_sp(f: &TrapFrame) -> usize {
+    f.x[2]
+}
+pub fn set_sp(f: &mut TrapFrame, sp: usize) {
+    f.x[2] = sp;
+}
+pub fn frame_pc(f: &TrapFrame) -> usize {
+    f.pc
+}
+pub fn set_frame_tls(f: &mut TrapFrame, tls: usize) {
+    f.x[4] = tls;
+}
+
+pub fn new_user_frame(pc: usize, sp: usize) -> TrapFrame {
+    let mut f = TrapFrame { x: [0; 32], pc, sstatus: (1 << 5) | (1 << 13) };
+    f.x[2] = sp;
+    f
+}
+
+/// # Safety
+/// `f` must be the trap frame at the top of the current kernel stack.
+pub unsafe fn jump_to_user(f: *mut TrapFrame) -> ! {
+    unsafe { asm!("mv sp, {}", "j ret_to_user", in(reg) f, options(noreturn)) }
+}
+
+const UC: usize = 128;
+const MC: usize = UC + 176;
+pub const SIGFRAME_SIZE: usize = MC + 256 + 528;
+
+/// Builds the Linux `rt_sigframe` (arch/riscv/kernel/signal.c) and points the frame at the handler.
+pub fn setup_signal_frame(
+    f: &mut TrapFrame,
+    info: &crate::task::signal::SigInfo,
+    act: &crate::task::signal::SigAction,
+    oldmask: u64,
+    altstack: (usize, u32, usize),
+    stack_top: usize,
+    fp: &FpState,
+    tramp: usize,
+) -> crate::errno::Result<()> {
+    use crate::mm::vm::copy_to_user;
+    let base = (stack_top - SIGFRAME_SIZE) & !15;
+    let mut b = alloc::vec![0u8; SIGFRAME_SIZE];
+    b[..128].copy_from_slice(&info.to_bytes());
+    let put = |b: &mut [u8], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    put(&mut b, UC + 16, altstack.0 as u64);
+    b[UC + 24..UC + 28].copy_from_slice(&altstack.1.to_le_bytes());
+    put(&mut b, UC + 32, altstack.2 as u64);
+    put(&mut b, UC + 40, oldmask);
+    put(&mut b, MC, f.pc as u64);
+    for i in 1..32 {
+        put(&mut b, MC + 8 * i, f.x[i] as u64);
+    }
+    for i in 0..32 {
+        put(&mut b, MC + 256 + 8 * i, fp.f[i]);
+    }
+    b[MC + 512..MC + 516].copy_from_slice(&(fp.fcsr as u32).to_le_bytes());
+    copy_to_user(base, &b)?;
+    f.x[10] = info.signo as usize;
+    f.x[11] = base;
+    f.x[12] = base + UC;
+    f.x[1] = tramp;
+    f.x[2] = base;
+    f.pc = act.handler;
+    Ok(())
+}
+
+pub fn restore_signal_frame(f: &mut TrapFrame, fp: &mut FpState) -> crate::errno::Result<(u64, (usize, u32, usize))> {
+    use crate::mm::vm::copy_from_user;
+    let base = f.x[2];
+    let mut b = alloc::vec![0u8; SIGFRAME_SIZE];
+    copy_from_user(&mut b, base)?;
+    let get = |off: usize| u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+    f.pc = get(MC) as usize;
+    for i in 1..32 {
+        f.x[i] = get(MC + 8 * i) as usize;
+    }
+    for i in 0..32 {
+        fp.f[i] = get(MC + 256 + 8 * i);
+    }
+    fp.fcsr = u32::from_le_bytes(b[MC + 512..MC + 516].try_into().unwrap()) as u64;
+    let ss = (get(UC + 16) as usize, u32::from_le_bytes(b[UC + 24..UC + 28].try_into().unwrap()), get(UC + 32) as usize);
+    Ok((get(UC + 40), ss))
+}
+
+pub enum UserTrap {
+    Syscall,
+    PageFault(usize, crate::mm::vm::Access),
+    Signal(u32, i32, usize),
+}
+
+pub fn decode_user_trap(cause: usize, tval: usize, f: &TrapFrame) -> UserTrap {
+    use crate::mm::vm::Access;
+    use crate::task::signal::*;
+    match cause {
+        8 => UserTrap::Syscall,
+        12 => UserTrap::PageFault(tval, Access::Exec),
+        13 => UserTrap::PageFault(tval, Access::Read),
+        15 => UserTrap::PageFault(tval, Access::Write),
+        1 | 5 | 7 => UserTrap::Signal(SIGSEGV, 2, tval),
+        0 | 4 | 6 => UserTrap::Signal(SIGBUS, 1, tval),
+        3 => UserTrap::Signal(SIGTRAP, 1, f.pc),
+        _ => UserTrap::Signal(SIGILL, 1, f.pc),
+    }
+}
+
+/// AT_HWCAP: one bit per single-letter extension (arch/riscv/include/uapi/asm/hwcap.h).
+pub fn hwcap() -> (usize, usize) {
+    let mut h = 0;
+    for c in b"imafdc" {
+        h |= 1 << (c - b'a');
+    }
+    (h, 0)
+}
+
+pub const ELF_MACHINE: u16 = 243;
+pub const PLATFORM: &[u8] = b"riscv64";

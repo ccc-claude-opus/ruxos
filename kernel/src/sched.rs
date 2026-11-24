@@ -288,6 +288,22 @@ pub fn idle_loop() -> ! {
     }
 }
 
+/// Marks the current task as going to sleep (before registering where a waker will find it).
+pub fn prepare_sleep() {
+    current().state.store(SLEEPING, Ordering::Relaxed);
+}
+
+/// Ends a sleep that may not have happened (the condition became true after `prepare_sleep`): if a
+/// waker already queued us, let the scheduler consume that queue entry.
+pub fn finish_sleep() {
+    let t = current();
+    if t.state.compare_exchange(SLEEPING, RUNNING, Ordering::AcqRel, Ordering::Relaxed).is_err()
+        && t.state.load(Ordering::Acquire) == RUNNABLE
+    {
+        schedule();
+    }
+}
+
 pub enum WaitResult {
     Ok,
     TimedOut,
@@ -319,23 +335,27 @@ impl WaitQueue {
         let r = loop {
             {
                 let mut q = self.q.lock();
-                if cond() {
-                    break WaitResult::Ok;
-                }
-                if interruptible && crate::task::signal_pending() {
-                    break WaitResult::Interrupted;
-                }
-                if let Some(d) = deadline {
-                    if arch::ticks() >= d {
-                        break WaitResult::TimedOut;
-                    }
-                    if timer.is_none() {
-                        timer = Some(crate::time::add_timer(d, me.clone()));
-                    }
-                }
                 me.state.store(SLEEPING, Ordering::Relaxed);
                 if !q.iter().any(|t| Arc::ptr_eq(t, &me)) {
                     q.push_back(me.clone());
+                }
+            }
+            let r = if cond() {
+                Some(WaitResult::Ok)
+            } else if interruptible && crate::task::signal_pending() {
+                Some(WaitResult::Interrupted)
+            } else if deadline.is_some_and(|d| arch::ticks() >= d) {
+                Some(WaitResult::TimedOut)
+            } else {
+                None
+            };
+            if let Some(r) = r {
+                finish_sleep();
+                break r;
+            }
+            if let Some(d) = deadline {
+                if timer.is_none() {
+                    timer = Some(crate::time::add_timer(d, me.clone()));
                 }
             }
             schedule();
@@ -382,6 +402,18 @@ impl WaitQueue {
 
     pub fn is_empty(&self) -> bool {
         self.q.lock().is_empty()
+    }
+
+    /// Registers `t` (multi-queue waits: poll, epoll).
+    pub fn add(&self, t: &Arc<Task>) {
+        let mut q = self.q.lock();
+        if !q.iter().any(|x| Arc::ptr_eq(x, t)) {
+            q.push_back(t.clone());
+        }
+    }
+
+    pub fn remove(&self, t: &Arc<Task>) {
+        self.q.lock().retain(|x| !Arc::ptr_eq(x, t));
     }
 }
 
