@@ -76,6 +76,7 @@ pub fn print(args: fmt::Arguments) {
     let _ = Console.write_fmt(args);
 }
 
+#[allow(unused_macros)]
 macro_rules! print {
     ($($arg:tt)*) => ($crate::console::print(format_args!($($arg)*)));
 }
