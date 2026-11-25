@@ -121,7 +121,13 @@ impl Tty {
     /// One byte from the UART.
     pub fn receive(&self, mut c: u8) {
         if c == 0x14 && crate::kernel_param("ruxos.debug").is_some() {
-            crate::sched::dump_tasks();
+            if crate::kernel_param("ruxos.debug") != Some("short") {
+                crate::sched::dump_tasks();
+            }
+            crate::net::inet::dump();
+            crate::vfs::events::check_lost_wakeups();
+            crate::futex::check_lost_wakeups();
+            crate::net::unix::dump();
             return;
         }
         let mut sig = None;

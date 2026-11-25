@@ -50,6 +50,11 @@ impl PollQueue {
         }
     }
 
+    /// (sleepers, live watchers), for debugging.
+    pub fn debug_counts(&self) -> (bool, usize) {
+        (!self.wq.is_empty(), self.watchers.try_lock().map_or(usize::MAX, |w| w.iter().filter(|x| x.strong_count() > 0).count()))
+    }
+
     pub fn watch(&self, w: Weak<dyn Watcher>) {
         self.watchers.lock().push(w);
     }

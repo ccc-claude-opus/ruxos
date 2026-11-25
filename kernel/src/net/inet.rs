@@ -17,6 +17,8 @@ use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address};
 
 const TCP_BUF: usize = 256 * 1024;
+/// Listening smoltcp sockets kept ready per listener (refilled after every packet).
+const LISTEN_POOL: usize = 4;
 const UDP_BUF: usize = 64 * 1024;
 
 // ---- the smoltcp side
@@ -88,6 +90,9 @@ pub struct Stack {
 pub static STACK: SpinLock<Option<Stack>> = SpinLock::new(None);
 static NET_WQ: WaitQueue = WaitQueue::new();
 static KICKED: AtomicBool = AtomicBool::new(false);
+/// ticks of the last poll() and of the last net-thread wakeup (for dump())
+static LAST_POLL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LAST_WAKE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static NEXT_PORT: AtomicU16 = AtomicU16::new(32768);
 
 fn now() -> Instant {
@@ -114,11 +119,41 @@ pub fn kick() {
 
 /// Runs the protocol: receive, transmit, timers. Wakes sockets that may have changed.
 pub fn poll() {
+    LAST_POLL.store(crate::arch::ticks() as u64, Ordering::Relaxed);
+    use smoltcp::iface::{PollIngressSingleResult, PollResult};
+    // listeners refill their pools between packets, so a burst of SYNs finds a listening
+    // socket for each (Linux's SYN backlog); dropped only after STACK is released
+    let listeners: Vec<Arc<InetSocket>> = LISTENERS.lock().values().flatten().filter_map(|w| w.upgrade()).collect();
     let owners: Vec<Weak<InetSocket>> = {
         let mut g = STACK.lock();
         let Some(s) = g.as_mut() else { return };
-        let r = s.iface.poll(now(), &mut Dev, &mut s.sockets);
-        if r == smoltcp::iface::PollResult::None {
+        let t = now();
+        let mut changed = false;
+        loop {
+            match s.iface.poll_ingress_single(t, &mut Dev, &mut s.sockets) {
+                PollIngressSingleResult::None => break,
+                PollIngressSingleResult::PacketProcessed => {}
+                PollIngressSingleResult::SocketStateChanged => {
+                    changed = true;
+                    for l in &listeners {
+                        l.refill(s);
+                    }
+                }
+            }
+        }
+        // data reaching a socket the program has closed is answered with a reset (Linux does the
+        // same): the peer learns at once that its request will not be read, instead of waiting
+        for &h in CLOSING.lock().iter() {
+            let t = s.sockets.get_mut::<tcp::Socket>(h);
+            if t.recv_queue() > 0 && t.state() != tcp::State::Closed {
+                t.abort();
+                changed = true;
+            }
+        }
+        if s.iface.poll_egress(t, &mut Dev, &mut s.sockets) == PollResult::SocketStateChanged {
+            changed = true;
+        }
+        if !changed {
             return;
         }
         s.owners.values().cloned().collect()
@@ -150,6 +185,41 @@ extern "C" fn net_thread(_: usize) {
         let d = delay.unwrap_or(Duration::from_millis(1000)).total_micros().clamp(1000, 1_000_000);
         let deadline = crate::arch::ticks() + crate::time::ns_to_ticks(d * 1000);
         NET_WQ.wait_until(|| KICKED.load(Ordering::Acquire), Some(deadline), false);
+        LAST_WAKE.store(crate::arch::ticks() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Ctrl-T (with ruxos.debug): the TCP sockets and the NIC queues.
+pub fn dump() {
+    if let Some(n) = NIC.get() {
+        n.debug();
+    }
+    let Some(mut g) = STACK.try_lock() else {
+        println!("net: stack locked");
+        return;
+    };
+    let Some(s) = g.as_mut() else { return };
+    let t = crate::arch::ticks() as u64;
+    let ago = |x: u64| crate::time::ticks_to_ns(t.saturating_sub(x) as _) / 1_000_000;
+    println!("net: kicked {} poll_delay {:?} last poll {} ms ago, last wake {} ms ago", KICKED.load(Ordering::Relaxed), s.iface.poll_delay(now(), &s.sockets), ago(LAST_POLL.load(Ordering::Relaxed)), ago(LAST_WAKE.load(Ordering::Relaxed)));
+    for (h, sock) in s.sockets.iter() {
+        if let smoltcp::socket::Socket::Tcp(t) = sock {
+            if t.state() == tcp::State::Listen {
+                continue;
+            }
+            println!(
+                "net: {:?} {} {:?} -> {:?} rx {} tx {} can_recv {} can_send {} owner {}",
+                h,
+                t.state(),
+                t.local_endpoint(),
+                t.remote_endpoint(),
+                t.recv_queue(),
+                t.send_queue(),
+                t.can_recv(),
+                t.can_send(),
+                s.owners.get(&h).map_or(-1, |w| w.strong_count() as i64)
+            );
+        }
     }
 }
 
@@ -273,6 +343,23 @@ impl InetSocket {
         s.sockets.add(t)
     }
 
+    /// Keeps LISTEN_POOL smoltcp sockets of a listener in the Listen state.
+    fn refill(&self, s: &mut Stack) {
+        let Some(l) = *self.local.lock() else { return };
+        if l.ip[0] == 127 || l.port == 0 {
+            return;
+        }
+        let mut st = self.st.lock();
+        let State::Listening { pool, .. } = &mut *st else { return };
+        let listening = pool.iter().filter(|&&h| s.sockets.get::<tcp::Socket>(h).state() == tcp::State::Listen).count();
+        for _ in listening..LISTEN_POOL {
+            let h = Self::new_tcp(s);
+            let _ = s.sockets.get_mut::<tcp::Socket>(h).listen(IpListenEndpoint { addr: None, port: l.port });
+            self.own(s, h);
+            pool.push(h);
+        }
+    }
+
     /// The protocol moved: accept finished handshakes, wake waiters.
     fn on_poll(&self) {
         let mut moved = Vec::new();
@@ -283,21 +370,16 @@ impl InetSocket {
                 let mut i = 0;
                 while i < pool.len() {
                     let t = s.sockets.get_mut::<tcp::Socket>(pool[i]);
-                    if t.is_active() && t.state() != tcp::State::Listen {
+                    // accept() returns finished handshakes only (as Linux's accept queue): a socket
+                    // still in SYN-RECEIVED would read as end-of-file
+                    if t.is_active() && !matches!(t.state(), tcp::State::Listen | tcp::State::SynReceived) {
                         moved.push(pool.remove(i));
                     } else {
                         i += 1;
                     }
                 }
-                // keep the listening pool full
-                let port = self.local.lock().map_or(0, |l| l.port);
-                while pool.len() < 4 && port != 0 {
-                    let h = Self::new_tcp(s);
-                    let _ = s.sockets.get_mut::<tcp::Socket>(h).listen(IpListenEndpoint { addr: None, port });
-                    self.own(s, h);
-                    pool.push(h);
-                }
             }
+            self.refill(s);
             for &h in &moved {
                 let t = s.sockets.get_mut::<tcp::Socket>(h);
                 let peer = t.remote_endpoint().map(ep_sin).unwrap_or_default();
@@ -354,8 +436,14 @@ impl Drop for InetSocket {
         let Some(s) = g.as_mut() else { return };
         match st {
             State::Tcp { h } => {
-                // close gracefully; the socket is removed once closed (by the reaper below)
-                s.sockets.get_mut::<tcp::Socket>(h).close();
+                // close gracefully, or with a reset when data is left unread (as Linux does, RFC 2525
+                // 2.17); the socket is removed once closed (by the reaper below)
+                let t = s.sockets.get_mut::<tcp::Socket>(h);
+                if t.recv_queue() > 0 {
+                    t.abort();
+                } else {
+                    t.close();
+                }
                 s.owners.remove(&h);
                 CLOSING.lock().push(h);
             }
@@ -438,7 +526,7 @@ impl Socket for InetSocket {
         if l.ip[0] != 127 {
             let mut g = STACK.lock();
             if let Some(s) = g.as_mut() {
-                for _ in 0..4 {
+                for _ in 0..LISTEN_POOL {
                     let h = Self::new_tcp(s);
                     let _ = s.sockets.get_mut::<tcp::Socket>(h).listen(IpListenEndpoint { addr: None, port: l.port });
                     self.own(s, h);
@@ -501,10 +589,9 @@ impl Socket for InetSocket {
             *server.peer.lock() = Some(me_addr);
             {
                 let mut st = l.st.lock();
-                let State::Listening { backlog, max, .. } = &mut *st else { return Err(ECONNREFUSED) };
-                if backlog.len() >= *max {
-                    return Err(if nonblock { EAGAIN } else { ECONNREFUSED });
-                }
+                let State::Listening { backlog, .. } = &mut *st else { return Err(ECONNREFUSED) };
+                // A full accept queue only delays a TCP connect on Linux (the SYN is sent again
+                // until there is room); it never fails it. A local connection is queued at once.
                 backlog.push_back(server.clone());
             }
             *self.local.lock() = Some(me_addr);
@@ -621,11 +708,7 @@ impl Socket for InetSocket {
                     Some(Ok(buf))
                 } else if !t.may_recv() {
                     // FIN received, or reset
-                    if t.state() == tcp::State::Closed && t.remote_endpoint().is_none() && self.error.load(Ordering::Relaxed) == 0 {
-                        Some(Ok(Vec::new()))
-                    } else {
-                        Some(Ok(Vec::new()))
-                    }
+                    Some(Ok(Vec::new()))
                 } else {
                     None
                 }

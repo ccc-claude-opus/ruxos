@@ -25,6 +25,9 @@ cd /tmp && [ "$(pwd)" = /tmp ] || fail cwd
 /bin/abi > /tmp/abi.out 2>&1
 grep -v '^ok' /tmp/abi.out
 grep -q '^abi: 0 failures' /tmp/abi.out || fail abi
+/bin/futex ${futex:-1} > /tmp/futex.out 2>&1
+cat /tmp/futex.out
+grep -q '^futex: 0 failures' /tmp/futex.out || fail futex
 # glibc, dynamically linked (Debian's libc6 and dash in /sysroot)
 if [ -d /sysroot ]; then
     mount -t proc proc /sysroot/proc
@@ -33,6 +36,9 @@ if [ -d /sysroot ]; then
     chroot /sysroot /abi > /tmp/abi-glibc.out 2>&1
     grep -v '^ok' /tmp/abi-glibc.out
     grep -q '^abi: 0 failures' /tmp/abi-glibc.out || fail abi-glibc
+    chroot /sysroot /futex ${futex:-1} > /tmp/futex-glibc.out 2>&1
+    cat /tmp/futex-glibc.out
+    grep -q '^futex: 0 failures' /tmp/futex-glibc.out || fail futex-glibc
 fi
 # an ext4 disk: read it, and run Node.js from it when it has Node (the ruwebos system disk)
 if [ -b /dev/vda ]; then

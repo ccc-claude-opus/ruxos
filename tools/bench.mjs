@@ -18,8 +18,11 @@ const targets = [
 
 async function once(url) {
   const r = await fetch(url, { headers: { cookie: 'tz=UTC' } });
-  await r.arrayBuffer();
-  if (r.status >= 500) throw new Error(`${url}: ${r.status}`);
+  const body = await r.text();
+  if (r.status >= 500) {
+    const text = body.replace(/<(script|style)[^]*?<\/\1>/g, ' ').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    throw new Error(`${url}: ${r.status}: ${text.slice(-400)}`);
+  }
 }
 
 const pct = (xs, p) => xs[Math.min(xs.length - 1, Math.floor((xs.length * p) / 100))];

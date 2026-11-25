@@ -310,6 +310,12 @@ impl Mm {
 
     /// The physical page behind user address `va`, faulted in for `access`, with a reference the
     /// caller must drop (`frame::put_page`).
+    /// Whether `va` lies in a shared mapping (MAP_SHARED, shared memory): futexes there are keyed
+    /// by page, those in private mappings by (address space, address), as in Linux.
+    pub fn is_shared(&self, va: usize) -> bool {
+        find_vma(&self.inner.lock().vmas, va).is_some_and(|v| v.shared)
+    }
+
     pub fn get_user_page(&self, va: usize, access: Access) -> Result<usize> {
         if va >= arch::USER_TOP {
             return Err(EFAULT);

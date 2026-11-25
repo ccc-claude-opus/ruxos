@@ -168,6 +168,8 @@ pub struct Own {
     pub frame: *mut TrapFrame,
     pub orig_arg0: usize,
     pub in_syscall: bool,
+    /// The system call being carried out (-1: none), for /proc/PID/task/TID/syscall.
+    pub cur_syscall: isize,
     /// The mask to restore after a ppoll/pselect/sigsuspend wait, once a signal is delivered.
     pub saved_mask: Option<u64>,
 }
@@ -319,6 +321,7 @@ pub fn make_init(root: PathRef) -> Arc<Process> {
             frame: core::ptr::null_mut(),
             orig_arg0: 0,
             in_syscall: false,
+            cur_syscall: -1,
             saved_mask: None,
         }),
         comm: SpinLock::new(*b"init\0\0\0\0\0\0\0\0\0\0\0\0"),
@@ -466,6 +469,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: usize, ctid: usize, fra
             frame: fpos as *mut TrapFrame,
             orig_arg0: 0,
             in_syscall: false,
+            cur_syscall: -1,
             saved_mask: None,
         }),
         comm: SpinLock::new(*me.comm.lock()),

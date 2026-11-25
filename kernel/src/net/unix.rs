@@ -41,8 +41,10 @@ pub struct UnixSocket {
     local: SpinLock<Option<Vec<u8>>>,
     peer_addr: SpinLock<Option<Vec<u8>>>,
     pq: PollQueue,
-    /// the peer went away or shut down writing: reads see EOF
+    /// the peer is closed: reads see EOF once the queue is empty, writes fail with EPIPE
     peer_gone: AtomicBool,
+    /// the peer shut down writing (shutdown(SHUT_WR)): reads see EOF, but we may still write
+    peer_shut_wr: AtomicBool,
     shut_rd: AtomicBool,
     shut_wr: AtomicBool,
     /// pid, uid, gid of whoever created/connected the socket (SO_PEERCRED of the other side)
@@ -53,6 +55,39 @@ pub struct UnixSocket {
     bound_inode: SpinLock<Option<usize>>,
     sndbuf: AtomicU32,
     rcvbuf: AtomicU32,
+}
+
+/// Every unix socket, for the Ctrl-T dump (ruxos.debug only).
+static ALL: SpinLock<Vec<Weak<UnixSocket>>> = SpinLock::new(Vec::new());
+
+/// Ctrl-T: unix sockets with unread data, and who could be waiting for it.
+pub fn dump() {
+    let all: Vec<Arc<UnixSocket>> = {
+        let mut a = ALL.lock();
+        a.retain(|w| w.strong_count() > 0);
+        a.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    let mut n = 0;
+    for s in &all {
+        let Some(rx) = s.rx.try_lock() else { continue };
+        if rx.bytes == 0 {
+            continue;
+        }
+        n += 1;
+        let (sleepers, watchers) = s.pq.debug_counts();
+        println!(
+            "unix {:p}: type {} {} bytes in {} segments unread, pid {} (peer pid {}), sleepers {} epoll watchers {}",
+            Arc::as_ptr(s),
+            s.ty,
+            rx.bytes,
+            rx.segs.len(),
+            s.cred.0.load(Ordering::Relaxed),
+            s.peer_cred.try_lock().map_or(0, |c| c.0),
+            sleepers,
+            watchers
+        );
+    }
+    println!("unix: {} sockets, {} with unread data", all.len(), n);
 }
 
 static BY_INODE: SpinLock<BTreeMap<usize, Weak<UnixSocket>>> = SpinLock::new(BTreeMap::new());
@@ -105,7 +140,7 @@ impl UnixSocket {
             return Err(ESOCKTNOSUPPORT);
         }
         let (p, u, g) = my_cred();
-        Ok(Arc::new_cyclic(|me| UnixSocket {
+        let s = Arc::new_cyclic(|me| UnixSocket {
             ty,
             me: me.clone(),
             conn: SpinLock::new(Conn::None),
@@ -114,6 +149,7 @@ impl UnixSocket {
             peer_addr: SpinLock::new(None),
             pq: PollQueue::new(),
             peer_gone: AtomicBool::new(false),
+            peer_shut_wr: AtomicBool::new(false),
             shut_rd: AtomicBool::new(false),
             shut_wr: AtomicBool::new(false),
             cred: (AtomicU32::new(p), AtomicU32::new(u), AtomicU32::new(g)),
@@ -122,7 +158,15 @@ impl UnixSocket {
             bound_inode: SpinLock::new(None),
             sndbuf: AtomicU32::new(CAPACITY as u32),
             rcvbuf: AtomicU32::new(CAPACITY as u32),
-        }))
+        });
+        if crate::kernel_param("ruxos.debug").is_some() {
+            let mut a = ALL.lock();
+            if a.len() >= 4096 {
+                a.retain(|w| w.strong_count() > 0);
+            }
+            a.push(Arc::downgrade(&s));
+        }
+        Ok(s)
     }
 
     /// Two connected sockets (socketpair).
@@ -187,6 +231,12 @@ impl UnixSocket {
         crate::vfs::path::may(&i, 2, &crate::syscall::fs::cred())?;
         let key = Arc::as_ptr(&i) as *const u8 as usize;
         BY_INODE.lock().get(&key).and_then(|w| w.upgrade()).ok_or(ECONNREFUSED)
+    }
+
+    /// Nothing more will arrive (Linux: RCV_SHUTDOWN).
+    fn rcv_shut(&self) -> bool {
+        self.shut_rd.load(Ordering::SeqCst)
+            || (self.connection_oriented() && (self.peer_gone.load(Ordering::SeqCst) || self.peer_shut_wr.load(Ordering::SeqCst)))
     }
 
     fn room(&self) -> usize {
@@ -378,7 +428,9 @@ impl Socket for UnixSocket {
             },
             (None, false) => self.peer().ok_or(if matches!(&*self.conn.lock(), Conn::DgramPeer { .. }) { ECONNREFUSED } else { EDESTADDRREQ })?,
         };
-        if target.shut_rd.load(Ordering::SeqCst) || (self.connection_oriented() && self.peer_gone.load(Ordering::SeqCst)) {
+        if target.shut_rd.load(Ordering::SeqCst)
+            || (self.connection_oriented() && (self.peer_gone.load(Ordering::SeqCst) || self.shut_wr.load(Ordering::SeqCst)))
+        {
             if flags & MSG_NOSIGNAL == 0 {
                 crate::task::send_signal_current(crate::task::signal::SIGPIPE);
             }
@@ -494,8 +546,12 @@ impl Socket for UnixSocket {
                     return Ok(out);
                 }
             }
-            if self.shut_rd.load(Ordering::SeqCst) || (self.connection_oriented() && self.peer_gone.load(Ordering::SeqCst)) {
-                return Ok(Msg::default());
+            if self.rcv_shut() {
+                // the peer may have queued its last data and closed since the queue was looked at
+                if self.rx.lock().segs.is_empty() {
+                    return Ok(Msg::default());
+                }
+                continue;
             }
             if self.connection_oriented() && !matches!(&*self.conn.lock(), Conn::Connected { .. }) {
                 return Err(ENOTCONN);
@@ -504,7 +560,7 @@ impl Socket for UnixSocket {
                 return Err(EAGAIN);
             }
             let r = self.pq.wq.wait_until(
-                || !self.rx.lock().segs.is_empty() || self.shut_rd.load(Ordering::SeqCst) || self.peer_gone.load(Ordering::SeqCst),
+                || !self.rx.lock().segs.is_empty() || self.rcv_shut(),
                 None,
                 true,
             );
@@ -524,8 +580,15 @@ impl Socket for UnixSocket {
         if how == 1 || how == 2 {
             self.shut_wr.store(true, Ordering::SeqCst);
             if let Some(p) = self.peer() {
-                p.peer_gone.store(true, Ordering::SeqCst);
+                // a half-close: the peer reads EOF but may go on writing to us
+                p.peer_shut_wr.store(true, Ordering::SeqCst);
                 p.pq.notify(POLLIN | POLLRDHUP);
+            }
+        }
+        if how == 0 || how == 2 {
+            // the peer's writes now fail (Linux mirrors RCV_SHUTDOWN as the peer's SEND_SHUTDOWN)
+            if let Some(p) = self.peer() {
+                p.pq.notify(POLLOUT | POLLHUP);
             }
         }
         self.pq.notify(POLLIN | POLLOUT);
@@ -615,11 +678,18 @@ impl Socket for UnixSocket {
         if !self.rx.lock().segs.is_empty() {
             ev |= POLLIN | POLLRDNORM;
         }
-        if self.connection_oriented() && self.peer_gone.load(Ordering::Relaxed) {
-            ev |= POLLIN | POLLRDHUP | POLLHUP;
-        }
-        if self.shut_rd.load(Ordering::Relaxed) {
+        // as Linux's unix_poll: RCV_SHUTDOWN reads as POLLIN|POLLRDHUP, both directions shut as POLLHUP
+        let rcv = self.rcv_shut();
+        if rcv {
             ev |= POLLIN | POLLRDHUP;
+        }
+        if self.connection_oriented() {
+            let snd = self.shut_wr.load(Ordering::Relaxed)
+                || self.peer_gone.load(Ordering::Relaxed)
+                || self.peer().is_some_and(|p| p.shut_rd.load(Ordering::Relaxed));
+            if rcv && snd {
+                ev |= POLLHUP;
+            }
         }
         ev
     }

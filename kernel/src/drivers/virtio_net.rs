@@ -27,8 +27,11 @@ pub static NIC: crate::sync::Once<Arc<VirtioNet>> = crate::sync::Once::new();
 
 pub static IRQS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+pub static LAST_IRQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 fn irq(_n: u32) {
     IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    LAST_IRQ.store(crate::arch::ticks(), core::sync::atomic::Ordering::Relaxed);
     if let Some(n) = NIC.get() {
         n.rx.mmio.ack_interrupt();
         n.rx.collect();
@@ -92,6 +95,10 @@ impl VirtioNet {
         let pending = self.rx_bufs.lock().1.len();
         let (tu, tl, tf, ta) = self.tx.debug_state();
         println!("net: rx used {} seen {} free {} avail {} posted {} irqs {} | tx used {} seen {} free {} avail {}", u, l, f, a, pending, IRQS.load(core::sync::atomic::Ordering::Relaxed), tu, tl, tf, ta);
+        #[cfg(target_arch = "aarch64")]
+        crate::arch::gic::dump();
+        #[cfg(target_arch = "aarch64")]
+        println!("net: irq {} on cpu {} (pend, act, en, cfg, target, prio, rpr, hppir, pmr, ctlr) {:?} status {:#x} last irq {} ms ago", self.irq, crate::percpu::this().id, crate::arch::gic::state(self.irq), self.rx.mmio.r(0x60), crate::time::ticks_to_ns(crate::arch::ticks().saturating_sub(LAST_IRQ.load(core::sync::atomic::Ordering::Relaxed))) / 1_000_000);
     }
 
     pub fn send(&self, frame: &[u8]) -> Result<()> {

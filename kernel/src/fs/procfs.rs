@@ -251,6 +251,8 @@ fn pid_entries(dev: u64, pid: u32, tid: Option<u32>) -> Vec<(Vec<u8>, Arc<dyn In
         entry("mounts", file(dev, kb_("mounts"), 0o444, generate(|p, _| mounts(p, false)), None)),
         entry("limits", file(dev, kb_("limits"), 0o444, generate(pid_limits), None)),
         entry("oom_score_adj", file(dev, kb_("oom_score_adj"), 0o644, alloc::boxed::Box::new(|| text(String::from("0\n"))), Some(alloc::boxed::Box::new(|_| Ok(()))))),
+        entry("syscall", file(dev, kb_("syscall"), 0o400, generate(pid_syscall), None)),
+        entry("wchan", file(dev, kb_("wchan"), 0o444, generate(pid_wchan), None)),
         entry("comm", file(dev, kb_("comm"), 0o644, generate(pid_comm), Some(alloc::boxed::Box::new(move |d: &[u8]| {
             let t = thread_of(pid, tid)?;
             let th = task::thread_of(&t).ok_or(ESRCH)?;
@@ -323,6 +325,63 @@ fn comm(t: &crate::sched::Task) -> String {
 fn pid_comm(pid: u32, tid: Option<u32>) -> Result<Vec<u8>> {
     let t = thread_of(pid, tid)?;
     text(format!("{}\n", comm(&t)))
+}
+
+/// The trap frame of a thread that is not running (it sits on its kernel stack), and whether the
+/// thread is inside a system call.
+fn parked_frame(t: &Arc<crate::sched::Task>) -> Option<(crate::arch::TrapFrame, usize, bool)> {
+    if t.state.load(core::sync::atomic::Ordering::Acquire) != crate::sched::SLEEPING {
+        return None;
+    }
+    let th = task::thread_of(t)?;
+    // SAFETY: a sleeping thread does not change its own state; the frame lives on its kernel stack
+    // as long as the task exists (we hold a reference).
+    let own = unsafe { &*th.own.get() };
+    if own.frame.is_null() {
+        return None;
+    }
+    Some((unsafe { (*own.frame).clone() }, own.orig_arg0, own.cur_syscall >= 0))
+}
+
+/// /proc/PID/task/TID/syscall: "nr arg1..arg6 sp pc" while blocked in a system call, "-1 sp pc"
+/// otherwise, "running" for a thread on a CPU or ready to run.
+fn pid_syscall(pid: u32, tid: Option<u32>) -> Result<Vec<u8>> {
+    let t = thread_of(pid, tid)?;
+    let Some((f, a0, in_sys)) = parked_frame(&t) else { return text(String::from("running\n")) };
+    let (sp, pc) = (crate::arch::frame_sp(&f), crate::arch::frame_pc(&f));
+    if !in_sys {
+        return text(format!("-1 {:#x} {:#x}\n", sp, pc));
+    }
+    let mut a = crate::arch::syscall_args(&f);
+    a[0] = a0;
+    text(format!("{} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}\n", crate::arch::syscall_nr(&f), a[0], a[1], a[2], a[3], a[4], a[5], sp, pc))
+}
+
+/// /proc/PID/task/TID/wchan: where a sleeping thread waits, named after the Linux function that
+/// waits for the same thing; "0" when it is not sleeping.
+fn pid_wchan(pid: u32, tid: Option<u32>) -> Result<Vec<u8>> {
+    let t = thread_of(pid, tid)?;
+    let Some((f, _, in_sys)) = parked_frame(&t) else { return text(String::from("0")) };
+    let name = if !in_sys {
+        "do_signal_stop"
+    } else {
+        match crate::arch::syscall_nr(&f) {
+            98 => "futex_wait_queue",
+            22 => "do_epoll_wait",
+            72 => "do_select",
+            73 => "do_sys_poll",
+            63 | 65 => "wait_woken",
+            64 | 66 => "wait_woken",
+            101 | 115 => "hrtimer_nanosleep",
+            202 | 242 => "inet_csk_accept",
+            203 => "inet_wait_for_connect",
+            206 | 207 | 211 | 212 => "wait_woken",
+            260 => "do_wait",
+            133 => "sigsuspend",
+            _ => "schedule",
+        }
+    };
+    text(String::from(name))
 }
 
 fn rss_pages(p: &Process) -> usize {

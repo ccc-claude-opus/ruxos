@@ -13,7 +13,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <netinet/in.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -294,6 +296,68 @@ static void test_files(void) {
     CHECK("fcntl-locks", WIFEXITED(st2) && WEXITSTATUS(st2) == 0, "status %x", st2);
 }
 
+
+// Half-close and close on a connected stream pair (a, b): shutdown(SHUT_WR) ends only one
+// direction; data written before a close is still read before end-of-file.
+static void stream_semantics(const char *kind, int a, int b) {
+    char name[64], buf[16];
+    struct pollfd p = {b, POLLIN | POLLOUT | POLLRDHUP, 0};
+    snprintf(name, sizeof name, "%s-shut-wr", kind);
+    CHECK(name, write(a, "req", 3) == 3 && shutdown(a, SHUT_WR) == 0, "errno %d", errno);
+    snprintf(name, sizeof name, "%s-half-close-read", kind);
+    CHECK(name, read(b, buf, sizeof buf) == 3 && read(b, buf, sizeof buf) == 0, "errno %d", errno);
+    poll(&p, 1, 0);
+    snprintf(name, sizeof name, "%s-half-close-poll", kind);
+    CHECK(name, (p.revents & (POLLIN | POLLRDHUP | POLLOUT)) == (POLLIN | POLLRDHUP | POLLOUT) && !(p.revents & POLLHUP), "revents %#x", p.revents);
+    snprintf(name, sizeof name, "%s-write-after-peer-shut-wr", kind);
+    CHECK(name, write(b, "resp", 4) == 4, "errno %d", errno);
+    snprintf(name, sizeof name, "%s-read-reply", kind);
+    CHECK(name, read(a, buf, sizeof buf) == 4 && memcmp(buf, "resp", 4) == 0, "errno %d", errno);
+    snprintf(name, sizeof name, "%s-write-after-shut-wr", kind);
+    errno = 0;
+    CHECK(name, write(a, "x", 1) == -1 && errno == EPIPE, "errno %d", errno);
+    // b writes its last bytes and closes: a reads them, then end-of-file
+    CHECK("stream-last-write", write(b, "bye", 3) == 3, "errno %d", errno);
+    close(b);
+    snprintf(name, sizeof name, "%s-data-before-eof", kind);
+    CHECK(name, read(a, buf, sizeof buf) == 3 && read(a, buf, sizeof buf) == 0, "errno %d", errno);
+    p.fd = a;
+    p.events = POLLIN | POLLRDHUP;
+    poll(&p, 1, 0);
+    snprintf(name, sizeof name, "%s-closed-poll", kind);
+    CHECK(name, (p.revents & (POLLIN | POLLHUP)) == (POLLIN | POLLHUP), "revents %#x", p.revents);
+    close(a);
+}
+
+static void test_sockets(void) {
+    signal(SIGPIPE, SIG_IGN);
+    int sv[2];
+    CHECK("socketpair", socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "errno %d", errno);
+    stream_semantics("unix", sv[0], sv[1]);
+    // loopback TCP
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t len = sizeof sa;
+    CHECK("tcp-listen", bind(l, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(l, 1) == 0 && getsockname(l, (struct sockaddr *)&sa, &len) == 0, "errno %d", errno);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    // more connections than the backlog: connect does not fail (Linux only delays it)
+    int c2 = socket(AF_INET, SOCK_STREAM, 0), c3 = socket(AF_INET, SOCK_STREAM, 0);
+    int rc = connect(c, (struct sockaddr *)&sa, sizeof sa);
+    CHECK("tcp-connect", rc == 0, "errno %d", errno);
+    if (rc != 0) return;
+    int s = accept(l, NULL, NULL);
+    CHECK("tcp-accept", s >= 0, "errno %d", errno);
+    fcntl(c2, F_SETFL, O_NONBLOCK);
+    fcntl(c3, F_SETFL, O_NONBLOCK);
+    int r2 = connect(c2, (struct sockaddr *)&sa, sizeof sa), e2 = errno;
+    int r3 = connect(c3, (struct sockaddr *)&sa, sizeof sa), e3 = errno;
+    CHECK("tcp-connect-full-backlog", (r2 == 0 || e2 == EINPROGRESS) && (r3 == 0 || e3 == EINPROGRESS), "%d/%d %d/%d", r2, e2, r3, e3);
+    close(c2);
+    close(c3);
+    stream_semantics("tcp", c, s);
+    close(l);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "child-exec") == 0) return 42;
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -302,6 +366,7 @@ int main(int argc, char **argv) {
     test_memory();
     test_time();
     test_files();
+    test_sockets();
     pid_t pid = fork();
     if (pid == 0) {
         execl(argv[0], argv[0], "child-exec", (char *)NULL);

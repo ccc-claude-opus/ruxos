@@ -28,6 +28,9 @@ struct Waiter {
     task: Arc<Task>,
     bitset: u32,
     woken: AtomicBool,
+    /// for the Ctrl-T check: the value slept on and the word's physical address then
+    val: u32,
+    pa: usize,
 }
 
 const NB: usize = 256;
@@ -45,8 +48,13 @@ fn key_of(uaddr: usize, private: bool) -> Result<(Key, usize)> {
     }
     let mm = vm::current_mm();
     let pa = mm.get_user_page(uaddr, Access::Read)?;
-    let key = if private { Key(mm.id, uaddr) } else { Key(0, pa + (uaddr & 0xfff)) };
-    Ok((key, pa))
+    Ok((key_in(&mm, uaddr, pa, private), pa))
+}
+
+/// A futex without FUTEX_PRIVATE_FLAG is still private when its mapping is (the page behind a
+/// private mapping changes on copy-on-write, so it cannot be the key).
+fn key_in(mm: &vm::Mm, uaddr: usize, pa: usize, private: bool) -> Key {
+    if private || !mm.is_shared(uaddr) { Key(mm.id, uaddr) } else { Key(0, pa + (uaddr & 0xfff)) }
 }
 
 fn word(pa: usize, uaddr: usize) -> &'static AtomicU32 {
@@ -61,7 +69,7 @@ pub fn wait(uaddr: usize, val: u32, deadline: Option<u64>, bitset: u32, private:
     let (key, pa) = key_of(uaddr, private)?;
     let me = sched::current_arc();
     me.wchan.store(0xf00, Ordering::Relaxed);
-    let w = Arc::new(Waiter { key: SpinLock::new(key), task: me.clone(), bitset, woken: AtomicBool::new(false) });
+    let w = Arc::new(Waiter { key: SpinLock::new(key), task: me.clone(), bitset, woken: AtomicBool::new(false), val, pa: pa + (uaddr & 0xfff) });
     {
         let mut b = bucket(key).lock();
         let cur = word(pa, uaddr).load(Ordering::SeqCst);
@@ -161,23 +169,34 @@ pub fn requeue(uaddr: usize, private: bool, n: usize, uaddr2: usize, n2: usize, 
     }
     frame::put_page(pa1);
     let woken = wake_key(k1, n, u32::MAX);
-    // move the rest
-    let mut moved = Vec::new();
-    {
-        let mut b = bucket(k1).lock();
-        let mut i = 0;
-        while i < b.len() && moved.len() < n2 {
-            if *b[i].key.lock() == k1 {
-                let w = b.remove(i);
-                *w.key.lock() = k2;
-                moved.push(w);
-            } else {
-                i += 1;
+    // move the rest, holding both buckets (a waiter leaving the queue finds its bucket by its
+    // key under the bucket lock, so key and bucket must change together)
+    let (b1, b2) = (bucket(k1), bucket(k2));
+    let same = core::ptr::eq(b1, b2);
+    let (first, second) = if (b1 as *const _ as usize) <= (b2 as *const _ as usize) { (b1, b2) } else { (b2, b1) };
+    let mut g1 = first.lock();
+    let mut g2 = if same { None } else { Some(second.lock()) };
+    let (src, mut dst): (&mut Vec<Arc<Waiter>>, Option<&mut Vec<Arc<Waiter>>>) = match g2.as_deref_mut() {
+        None => (&mut *g1, None),
+        Some(v2) if core::ptr::eq(first, b1) => (&mut *g1, Some(v2)),
+        Some(v2) => (v2, Some(&mut *g1)),
+    };
+    let mut count = 0;
+    let mut i = 0;
+    while i < src.len() && count < n2 {
+        if *src[i].key.lock() == k1 {
+            *src[i].key.lock() = k2;
+            count += 1;
+            match dst {
+                Some(ref mut d) => d.push(src.remove(i)),
+                None => i += 1,
             }
+        } else {
+            i += 1;
         }
     }
-    let count = moved.len();
-    bucket(k2).lock().extend(moved);
+    drop(g2);
+    drop(g1);
     Ok(woken + count)
 }
 
@@ -187,7 +206,7 @@ pub fn wake_op(uaddr: usize, private: bool, n: usize, uaddr2: usize, n2: usize, 
     frame::put_page(pa1);
     let mm = vm::current_mm();
     let pa2 = mm.get_user_page(uaddr2, Access::Write)?;
-    let k2 = if private { Key(mm.id, uaddr2) } else { Key(0, pa2 + (uaddr2 & 0xfff)) };
+    let k2 = key_in(&mm, uaddr2, pa2, private);
     let w = word(pa2, uaddr2);
     let shift = (op >> 28) & 8 != 0;
     let mut oparg = (op >> 12) & 0xfff;
@@ -279,4 +298,23 @@ pub fn exit_robust_list(head: usize) {
     if pending != 0 {
         handle(pending);
     }
+}
+
+/// Ctrl-T: futex waiters whose word no longer holds the value they slept on (a missed wake, or a
+/// word changed without FUTEX_WAKE).
+pub fn check_lost_wakeups() {
+    let (mut total, mut odd) = (0, 0);
+    for b in BUCKETS.iter() {
+        let Some(b) = b.try_lock() else { continue };
+        for w in b.iter() {
+            total += 1;
+            let cur = unsafe { core::ptr::read_volatile(arch::phys_to_virt(w.pa) as *const u32) };
+            if cur != w.val {
+                odd += 1;
+                let k = *w.key.lock();
+                println!("futex: task {} waits on ({:#x}, {:#x}) for {:#x}, word is {:#x}, bitset {:#x}", w.task.tid, k.0, k.1, w.val, cur, w.bitset);
+            }
+        }
+    }
+    println!("futex: {} waiters, {} with a changed word", total, odd);
 }

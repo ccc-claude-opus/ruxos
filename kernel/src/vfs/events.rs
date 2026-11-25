@@ -26,6 +26,8 @@ struct Item {
     data: u64,
     watcher: Arc<ItemWatcher>,
     queued: bool,
+    /// what the last harvest saw (edge-triggered lost-wakeup check)
+    last: u32,
 }
 
 struct ItemWatcher {
@@ -49,15 +51,80 @@ pub struct Epoll {
     inode: Arc<dyn Inode>,
 }
 
+/// Every epoll instance, for the Ctrl-T check (ruxos.debug only).
+static ALL: SpinLock<Vec<Weak<Epoll>>> = SpinLock::new(Vec::new());
+
+fn kind(f: &File) -> &'static str {
+    let a = f.ops.as_any();
+    if let Some(s) = a.downcast_ref::<crate::net::SocketFile>() {
+        let s = s.sock.as_any();
+        if s.is::<crate::net::inet::InetSocket>() {
+            return "inet";
+        }
+        if s.is::<crate::net::unix::UnixSocket>() {
+            return "unix";
+        }
+        return "socket";
+    }
+    if a.is::<super::pipe::PipeEnd>() {
+        return "pipe";
+    }
+    if a.is::<EventFd>() {
+        return "eventfd";
+    }
+    if a.is::<EpollFile>() {
+        return "epoll";
+    }
+    "other"
+}
+
+/// Ctrl-T: epoll instances with sleepers and an empty ready list although a watched file is ready
+/// (a lost wakeup).
+pub fn check_lost_wakeups() {
+    let eps: Vec<Arc<Epoll>> = {
+        let mut a = ALL.lock();
+        a.retain(|w| w.strong_count() > 0);
+        a.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    let mut n = 0;
+    for ep in eps {
+        let Some(items) = ep.items.try_lock() else { continue };
+        let ready = ep.ready.try_lock().map_or(usize::MAX, |r| r.len());
+        let sleepers = !ep.pq.wq.is_empty();
+        for (key, it) in items.iter() {
+            let Some(f) = it.file.upgrade() else { continue };
+            let mask = (it.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE | EPOLLWAKEUP)) | EPOLLERR | EPOLLHUP;
+            if it.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE | EPOLLWAKEUP) == 0 {
+                continue;
+            }
+            let r = f.ops.poll(&f) & mask;
+            let lost = if it.events & EPOLLET != 0 { r & !it.last != 0 } else { r != 0 };
+            if lost && !it.queued {
+                println!("epoll {:p}: fd {} ({}) ready {:#x} (last seen {:#x}) events {:#x} not queued; ready list {} sleepers {}", Arc::as_ptr(&ep), key.0, kind(&f), r, it.last, it.events, ready, sleepers);
+                n += 1;
+            }
+        }
+    }
+    println!("epoll: {} ready-but-unqueued items", n);
+}
+
 impl Epoll {
     pub fn new() -> Arc<Epoll> {
-        Arc::new_cyclic(|me| Epoll {
+        let ep = Arc::new_cyclic(|me| Epoll {
             items: SpinLock::new(BTreeMap::new()),
             ready: SpinLock::new(VecDeque::new()),
             pq: PollQueue::new(),
             me: me.clone(),
             inode: super::anon::AnonInode::new(0o600),
-        })
+        });
+        if crate::kernel_param("ruxos.debug").is_some() {
+            let mut a = ALL.lock();
+            if a.len() >= 4096 {
+                a.retain(|w| w.strong_count() > 0);
+            }
+            a.push(Arc::downgrade(&ep));
+        }
+        ep
     }
 
     fn make_ready(&self, key: Key) {
@@ -89,7 +156,7 @@ impl Epoll {
                     let ww: Arc<dyn Watcher> = w.clone();
                     q.watch(Arc::downgrade(&ww));
                 }
-                self.items.lock().insert(key, Item { file: Arc::downgrade(file), events, data, watcher: w, queued: false });
+                self.items.lock().insert(key, Item { file: Arc::downgrade(file), events, data, watcher: w, queued: false, last: 0 });
                 self.make_ready(key);
             }
             2 => {
@@ -137,6 +204,9 @@ impl Epoll {
             };
             let mask = (events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE | EPOLLWAKEUP)) | EPOLLERR | EPOLLHUP;
             let r = file.ops.poll(&file) & mask;
+            if let Some(it) = self.items.lock().get_mut(&key) {
+                it.last = r;
+            }
             if r == 0 || events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE | EPOLLWAKEUP) == 0 && events & EPOLLONESHOT != 0 {
                 continue;
             }

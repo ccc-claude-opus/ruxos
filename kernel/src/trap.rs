@@ -22,7 +22,9 @@ pub fn user_exception(f: &mut TrapFrame, cause: usize, addr: usize) {
             me.nr_count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let args = arch::syscall_args(f);
             o.orig_arg0 = args[0];
+            o.cur_syscall = nr as isize;
             let r = crate::syscall::dispatch(nr, args, f);
+            own().cur_syscall = -1;
             if nr != crate::syscall::nr::RT_SIGRETURN {
                 arch::set_syscall_ret(f, r as usize);
                 own().in_syscall = true;
