@@ -53,6 +53,48 @@
       "p99_ms": 5.12,
       "rps": 2572
     },
-    "memory_used_mb": 518
+    "memory_used_mb": 518,
+    "caged": false,
+    "note": "apps not caged (isolation=auto: bubblewrap could not build its cage before M8), so no cpu.max; not comparable with linux"
+  },
+  "ruxos-caged": {
+    "date": "2026-11-25",
+    "caged": true,
+    "home page": {
+      "p50_ms": 1.64,
+      "p99_ms": 5.9,
+      "rps": 895
+    },
+    "static file": {
+      "p50_ms": 1.53,
+      "p99_ms": 2.31,
+      "rps": 6803
+    },
+    "D1 query": {
+      "p50_ms": 1.53,
+      "p99_ms": 7.44,
+      "rps": 1083
+    },
+    "memory_used_mb": 534
+  },
+  "linux-caged": {
+    "date": "2026-11-25",
+    "caged": true,
+    "home page": {
+      "p50_ms": 3.03,
+      "p99_ms": 8.8,
+      "rps": 930
+    },
+    "static file": {
+      "p50_ms": 1.52,
+      "p99_ms": 2.61,
+      "rps": 6467
+    },
+    "D1 query": {
+      "p50_ms": 1.53,
+      "p99_ms": 10.61,
+      "rps": 867
+    },
+    "memory_used_mb": 615
   }
 }
