@@ -5,7 +5,7 @@ use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 pub const PAGE_SIZE: usize = 4096;
-pub const MAX_ORDER: usize = 13; // 32 MB blocks
+pub const MAX_ORDER: usize = 16; // 256 MB blocks (large boot-time buffers: an unpacked initramfs)
 
 #[repr(C)]
 pub struct PageMeta {

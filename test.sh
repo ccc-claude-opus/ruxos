@@ -14,10 +14,10 @@ run() { # run <arch> <accel> <test>
     arch=$1 accel=$2 t=$3
     console=ttyAMA0; [ $arch = riscv64 ] && console=ttyS0
     case $t in
-        m2) out=$(INITRD=out/$arch/test-initramfs.cpio.gz APPEND="console=$console rdinit=/init" timeout 300 tools/run.sh $arch --accel $accel --smp 4 2>&1 || true) ;;
+        m2) out=$(INITRD=out/$arch/test-initramfs.cpio.gz APPEND="console=$console rdinit=/init" timeout 900 tools/run.sh $arch --accel $accel --smp 4 2>&1 || true) ;;
         *) out=$(APPEND="console=$console ruxos.test=$t" timeout 120 tools/run.sh $arch --accel $accel --smp 4 2>&1 || true) ;;
     esac
-    line=$(echo "$out" | grep "ruxos-test $t:" | tail -1)
+    line=$(echo "$out" | grep -a "ruxos-test $t:" | tail -1)
     case $line in
         *": ok"*) echo "ok    $arch/$accel $line" ;;
         *) echo "FAIL  $arch/$accel $t"; echo "$out" | tail -15; fail=1 ;;

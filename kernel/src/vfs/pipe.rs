@@ -17,6 +17,7 @@ pub struct Pipe {
     had_writer: core::sync::atomic::AtomicBool,
     pub pq: PollQueue,
     pub capacity: AtomicUsize,
+    pub inode: Arc<dyn Inode>,
 }
 
 impl Pipe {
@@ -28,6 +29,7 @@ impl Pipe {
             had_writer: core::sync::atomic::AtomicBool::new(false),
             pq: PollQueue::new(),
             capacity: AtomicUsize::new(CAPACITY),
+            inode: super::anon::AnonInode::new(S_IFIFO | 0o600),
         })
     }
 
@@ -175,6 +177,10 @@ impl FileOps for PipeEnd {
 
     fn poll_queue(&self) -> Option<&PollQueue> {
         Some(&self.pipe.pq)
+    }
+
+    fn inode(&self) -> Option<Arc<dyn Inode>> {
+        Some(self.pipe.inode.clone())
     }
 
     fn ioctl(&self, _f: &File, cmd: u32, arg: usize) -> Result<isize> {

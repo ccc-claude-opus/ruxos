@@ -69,7 +69,12 @@ pub fn waitid(idtype: u32, id: i32, info: usize, options: u32, _ru: usize) -> Re
         0 => WaitWho::Any,
         1 => WaitWho::Pid(id as u32),
         2 => WaitWho::Pgid(if id == 0 { current_proc().pgid.load(Ordering::Relaxed) } else { id as u32 }),
-        3 => return Err(EINVAL), // P_PIDFD: with pidfd_open
+        3 => {
+            // P_PIDFD
+            let f = super::fs::file(id)?;
+            let pf = f.ops.as_any().downcast_ref::<crate::vfs::events::PidFd>().ok_or(EINVAL)?;
+            WaitWho::Pid(pf.proc.pid)
+        }
         _ => return Err(EINVAL),
     };
     if options & (WEXITED | WSTOPPED | WCONTINUED) == 0 {

@@ -25,6 +25,32 @@ cd /tmp && [ "$(pwd)" = /tmp ] || fail cwd
 /bin/abi > /tmp/abi.out 2>&1
 grep -v '^ok' /tmp/abi.out
 grep -q '^abi: 0 failures' /tmp/abi.out || fail abi
+# glibc, dynamically linked (Debian's libc6 and dash in /sysroot)
+if [ -d /sysroot ]; then
+    mount -t proc proc /sysroot/proc
+    mount -t tmpfs tmpfs /sysroot/tmp
+    [ "$(chroot /sysroot /usr/bin/dash -c 'echo $((6*7))')" = 42 ] || fail glibc-dash
+    chroot /sysroot /abi > /tmp/abi-glibc.out 2>&1
+    grep -v '^ok' /tmp/abi-glibc.out
+    grep -q '^abi: 0 failures' /tmp/abi-glibc.out || fail abi-glibc
+fi
+# an ext4 disk: read it, and run Node.js from it when it has Node (the ruwebos system disk)
+if [ -b /dev/vda ]; then
+    mount -t ext4 -o ro /dev/vda /mnt || fail mount-ext4
+    [ -d /mnt/etc ] || fail ext4-lookup
+    if [ -x /mnt/usr/local/bin/node ]; then
+        mount -t proc proc /mnt/proc
+        mount -t sysfs sysfs /mnt/sys
+        mount -t devtmpfs devtmpfs /mnt/dev
+        mount -t tmpfs tmpfs /mnt/tmp
+        cp /tests/basic.js /mnt/tmp/
+        chroot /mnt /usr/local/bin/node /tmp/basic.js > /tmp/node.out 2>&1
+        grep -v '^ok' /tmp/node.out
+        grep -q '^node-test: ok' /tmp/node.out || fail node
+    else
+        [ -x /mnt/bin/busybox ] && [ "$(chroot /mnt /bin/busybox echo hi)" = hi ] || fail ext4-exec
+    fi
+fi
 uname -a
 echo "ruxos-test m2: ok"
 poweroff -f

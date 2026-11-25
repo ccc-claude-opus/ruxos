@@ -1,6 +1,8 @@
 //! System calls: the generic Linux table (asm-generic/unistd.h), shared by arm64 and riscv64.
+pub mod events;
 pub mod fs;
 pub mod mm;
+pub mod net;
 pub mod poll;
 pub mod proc;
 pub mod time;
@@ -12,6 +14,11 @@ pub mod nr {
     pub const RT_SIGRETURN: usize = 139;
 }
 
+/// The name /proc/PID/fd shows for an anon_inode file.
+pub fn anon_name(f: &crate::vfs::File) -> &'static str {
+    crate::vfs::events::anon_name(f)
+}
+
 /// Unimplemented calls that ruwebos's programs probe (logged once per number with ruxos.strace).
 fn unknown(n: usize) -> Result<usize> {
     if crate::kernel_param("ruxos.strace").is_some() {
@@ -21,8 +28,18 @@ fn unknown(n: usize) -> Result<usize> {
 }
 
 pub fn dispatch(n: usize, a: [usize; 6], f: &mut TrapFrame) -> isize {
+    if STRACE.load(core::sync::atomic::Ordering::Relaxed) && crate::kernel_param("ruxos.strace") == Some("entry") {
+        println!("[{}] -> {}({:#x}, {:#x}, {:#x})", crate::sched::current().tid, n, a[0], a[1], a[2]);
+    }
     let r: Result<usize> = match n {
         17 => fs::getcwd(a[0], a[1]),
+        19 => events::eventfd2(a[0] as u32, a[1] as u32),
+        20 => events::epoll_create1(a[0] as u32),
+        21 => events::epoll_ctl(a[0] as i32, a[1] as u32, a[2] as i32, a[3]),
+        22 => events::epoll_pwait(a[0] as i32, a[1], a[2] as i32, a[3] as i32, a[4], a[5]),
+        74 => events::signalfd4(a[0] as i32, a[1], a[2], a[3] as u32),
+        424 => events::pidfd_send_signal(a[0] as i32, a[1] as u32, a[2], a[3] as u32),
+        441 => events::epoll_pwait2(a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5]),
         23 => fs::dup(a[0] as i32),
         24 => fs::dup3(a[0] as i32, a[1] as i32, a[2] as u32),
         25 => fs::fcntl(a[0] as i32, a[1] as u32, a[2]),
@@ -150,6 +167,21 @@ pub fn dispatch(n: usize, a: [usize; 6], f: &mut TrapFrame) -> isize {
         177 => Ok(crate::task::current_proc().cred.lock().egid as usize),
         178 => Ok(crate::sched::current().tid as usize),
         179 => proc::sysinfo(a[0]),
+        198 => net::socket(a[0] as u32, a[1] as u32, a[2] as i32),
+        199 => net::socketpair(a[0] as u32, a[1] as u32, a[2] as i32, a[3]),
+        200 => net::bind(a[0] as i32, a[1], a[2] as u32),
+        201 => net::listen(a[0] as i32, a[1] as i32),
+        202 => net::accept4(a[0] as i32, a[1], a[2], 0),
+        203 => net::connect(a[0] as i32, a[1], a[2] as u32),
+        204 => net::getsockname(a[0] as i32, a[1], a[2]),
+        205 => net::getpeername(a[0] as i32, a[1], a[2]),
+        206 => net::sendto(a[0] as i32, a[1], a[2], a[3] as u32, a[4], a[5] as u32),
+        207 => net::recvfrom(a[0] as i32, a[1], a[2], a[3] as u32, a[4], a[5]),
+        208 => net::setsockopt(a[0] as i32, a[1] as i32, a[2] as i32, a[3], a[4] as u32),
+        209 => net::getsockopt(a[0] as i32, a[1] as i32, a[2] as i32, a[3], a[4]),
+        210 => net::shutdown(a[0] as i32, a[1] as u32),
+        211 => net::sendmsg(a[0] as i32, a[1], a[2] as u32),
+        212 => net::recvmsg(a[0] as i32, a[1], a[2] as u32),
         213 => Ok(0), // readahead
         214 => mm::brk(a[0]),
         215 => mm::munmap(a[0], a[1]),
@@ -163,6 +195,8 @@ pub fn dispatch(n: usize, a: [usize; 6], f: &mut TrapFrame) -> isize {
         228..=231 | 284 => Ok(0), // mlock family: no swapping here, memory is always resident
         232 => mm::mincore(a[0], a[1], a[2]),
         233 => mm::madvise(a[0], a[1], a[2] as u32),
+        242 => net::accept4(a[0] as i32, a[1], a[2], a[3] as u32),
+        243 => net::recvmmsg(a[0] as i32, a[1], a[2] as u32, a[3] as u32, a[4]),
         240 => proc::rt_tgsigqueueinfo(a[0] as i32, a[1] as i32, a[2] as u32, a[3]),
         258 => Err(ENOSYS), // riscv_hwprobe: glibc falls back to AT_HWCAP
         #[cfg(target_arch = "riscv64")]
@@ -176,12 +210,13 @@ pub fn dispatch(n: usize, a: [usize; 6], f: &mut TrapFrame) -> isize {
         276 => fs::renameat2(a[0] as i32, a[1], a[2] as i32, a[3], a[4] as u32),
         278 => proc::getrandom(a[0], a[1], a[2] as u32),
         281 => proc::execve(a[0] as i32, a[1], a[2], a[3], a[4] as u32, f),
+        269 => net::sendmmsg(a[0] as i32, a[1], a[2] as u32, a[3] as u32),
         283 => proc::membarrier(a[0] as u32),
         285 => Err(EXDEV), // copy_file_range: callers fall back to read/write
         291 => fs::statx(a[0] as i32, a[1], a[2] as u32, a[3] as u32, a[4]),
         293 => Err(ENOSYS), // rseq: optional for glibc
         425..=427 => Err(ENOSYS), // io_uring: libuv falls back to epoll
-        434 => Err(ENOSYS),
+        434 => events::pidfd_open(a[0] as i32, a[1] as u32),
         435 => Err(ENOSYS), // clone3: glibc falls back to clone
         436 => fs::close_range(a[0] as u32, a[1] as u32, a[2] as u32),
         439 => fs::faccessat(a[0] as i32, a[1], a[2] as u32, a[3] as u32),

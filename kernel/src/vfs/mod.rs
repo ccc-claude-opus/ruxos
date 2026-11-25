@@ -1,12 +1,15 @@
 //! The virtual file system: inodes and file systems (traits), the page cache, dentries and mounts
 //! (path.rs), open files and descriptor tables (file.rs).
+pub mod anon;
 pub mod cpio;
 pub mod dev;
+pub mod events;
 pub mod file;
 pub mod path;
 pub mod pipe;
 pub mod shmem;
 pub mod poll;
+pub mod pseudo;
 pub mod tmpfs;
 
 use crate::errno::*;

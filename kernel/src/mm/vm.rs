@@ -34,6 +34,8 @@ pub struct Vma {
     pub offset: u64,
     pub dontfork: bool,
     pub kind: VmaKind,
+    /// The path of the mapped file (/proc/PID/maps).
+    pub path: Option<crate::vfs::PathRef>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -227,6 +229,14 @@ impl Mm {
         let writable = vma.prot & PROT_WRITE != 0;
         let e = self.pte(page_va, true).ok_or(ENOMEM)?;
         if arch::pte_valid(*e) && arch::pte_user_readable(*e) {
+            if access == Access::Exec && !arch::pte_user_executable(*e) {
+                // the mapping became executable (mprotect) after this page was mapped
+                let pa = arch::pte_pa(*e);
+                *e = arch::pte_user(pa, true, arch::pte_user_writable(*e), true);
+                arch::sync_icache(phys_to_virt(pa), PAGE_SIZE);
+                self.flush(page_va);
+                return Ok(());
+            }
             if access != Access::Write || arch::pte_user_writable(*e) {
                 // spurious (another CPU just fixed it, or a stale TLB entry)
                 arch::tlb_local_page(self.asid, page_va);
@@ -612,5 +622,22 @@ pub fn read_ptr_array(va: usize, max: usize) -> Result<Vec<usize>> {
         if v.len() > max {
             return Err(E2BIG);
         }
+    }
+}
+
+impl Mm {
+    /// Copies user memory of this address space (any process: /proc/PID/cmdline, environ).
+    pub fn read_mem(&self, va: usize, buf: &mut [u8]) -> Result<()> {
+        let mut done = 0;
+        while done < buf.len() {
+            let p = va + done;
+            let off = p & (PAGE_SIZE - 1);
+            let n = (PAGE_SIZE - off).min(buf.len() - done);
+            let pa = self.get_user_page(p, Access::Read)?;
+            buf[done..done + n].copy_from_slice(unsafe { core::slice::from_raw_parts((phys_to_virt(pa) + off) as *const u8, n) });
+            frame::put_page(pa);
+            done += n;
+        }
+        Ok(())
     }
 }

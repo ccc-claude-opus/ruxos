@@ -114,7 +114,9 @@ pub struct Process {
     pub pdeath_signal: AtomicU32,
     pub dumpable: AtomicU32,
     pub ctty: SpinLock<Option<Arc<crate::tty::Tty>>>,
-    pub pidfd_wq: WaitQueue,
+    pub pidfd_wq: crate::vfs::poll::PollQueue,
+    /// signalfds reading this process's signals (notified when one is sent).
+    pub signalfds: SpinLock<Vec<Weak<crate::vfs::poll::PollQueue>>>,
     pub itimer_gen: core::sync::atomic::AtomicU64,
 }
 
@@ -296,7 +298,8 @@ pub fn make_init(root: PathRef) -> Arc<Process> {
         pdeath_signal: AtomicU32::new(0),
         dumpable: AtomicU32::new(1),
         ctty: SpinLock::new(None),
-        pidfd_wq: WaitQueue::new(),
+        pidfd_wq: crate::vfs::poll::PollQueue::new(),
+        signalfds: SpinLock::new(Vec::new()),
         itimer_gen: core::sync::atomic::AtomicU64::new(0),
     });
     let th = UserThread {
@@ -434,7 +437,8 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: usize, ctid: usize, fra
             pdeath_signal: AtomicU32::new(0),
             dumpable: AtomicU32::new(proc.dumpable.load(Ordering::Relaxed)),
             ctty: SpinLock::new(proc.ctty.lock().clone()),
-            pidfd_wq: WaitQueue::new(),
+            pidfd_wq: crate::vfs::poll::PollQueue::new(),
+        signalfds: SpinLock::new(Vec::new()),
             itimer_gen: core::sync::atomic::AtomicU64::new(0),
         });
         parent.children.lock().push(p.clone());
@@ -507,8 +511,9 @@ pub fn exit(code: i32, group: bool) -> ! {
     let proc = me.proc.clone();
     if group && !proc.group_exit.swap(true, Ordering::SeqCst) {
         proc.group_exit_code.store(code, Ordering::SeqCst);
-        // kill the other threads
-        for t in proc.threads.lock().iter().filter_map(|w| w.upgrade()) {
+        // kill the other threads (collected first: sending takes the threads lock)
+        let threads: Vec<Arc<Task>> = proc.threads.lock().iter().filter_map(|w| w.upgrade()).collect();
+        for t in threads {
             if !core::ptr::eq(Arc::as_ptr(&t), sched::current()) {
                 signal::send_thread(&t, SigInfo::kernel(signal::SIGKILL));
             }
@@ -568,7 +573,7 @@ fn process_exit(proc: &Arc<Process>, status: i32) {
         }
     }
     proc.state.lock().exit_status = Some(status);
-    proc.pidfd_wq.wake_all();
+    proc.pidfd_wq.notify(crate::vfs::poll::POLLIN);
     match proc.parent() {
         Some(parent) => {
             if proc.exit_signal != 0 {

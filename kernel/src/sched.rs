@@ -30,6 +30,13 @@ pub struct Task {
     /// Running on a CPU, or its registers are still live there (until the switch away finishes).
     on_cpu: AtomicBool,
     pub is_idle: bool,
+    /// What the task waits for when sleeping (debugging).
+    pub wchan: core::sync::atomic::AtomicUsize,
+    /// The last system call and how many the task has made (debugging).
+    pub last_nr: core::sync::atomic::AtomicUsize,
+    pub nr_count: core::sync::atomic::AtomicUsize,
+    pub faults: core::sync::atomic::AtomicUsize,
+    pub last_fault: core::sync::atomic::AtomicUsize,
     /// Thread state that only matters for user threads (process, signals, FP registers...).
     pub user: UnsafeCell<Option<alloc::boxed::Box<crate::task::UserThread>>>,
 }
@@ -47,6 +54,11 @@ impl Task {
             cpu: AtomicUsize::new(0),
             on_cpu: AtomicBool::new(false),
             is_idle,
+            wchan: AtomicUsize::new(0),
+            last_nr: AtomicUsize::new(0),
+            nr_count: AtomicUsize::new(0),
+            faults: AtomicUsize::new(0),
+            last_fault: AtomicUsize::new(0),
             user: UnsafeCell::new(None),
         }
     }
@@ -138,6 +150,8 @@ pub fn enqueue(t: Arc<Task>) {
     }
     let pc = percpu::cpu(target);
     pc.rq.lock().push_back(t);
+    // pairs with the fence in idle_loop: either the idle CPU sees the task, or we see it idle
+    core::sync::atomic::fence(Ordering::SeqCst);
     if target == percpu::this().id {
         pc.need_resched.store(true, Ordering::Relaxed);
     } else if pc.idle.load(Ordering::Relaxed) {
@@ -192,12 +206,20 @@ pub fn schedule() {
         arch::irq_restore(irq);
         return;
     }
-    if next.is_idle && !cur.is_idle && cur.state.load(Ordering::Relaxed) == RUNNABLE {
-        // cur was woken (and queued elsewhere) while going to sleep: it will run from that queue
-    }
-    while next.on_cpu.load(Ordering::Acquire) {
-        core::hint::spin_loop();
-    }
+    // `next` may still be finishing its switch away from another CPU (it was woken while going
+    // to sleep there). Waiting for it here can deadlock (that CPU may be waiting for our task), so
+    // put it back and run the idle task this time; it is picked again once it has left that CPU.
+    let next = if !next.is_idle && next.on_cpu.load(Ordering::Acquire) {
+        pc.rq.lock().push_back(next);
+        pc.need_resched.store(true, Ordering::Relaxed);
+        if cur.is_idle {
+            arch::irq_restore(irq);
+            return;
+        }
+        unsafe { (*pc.idle_task.get()).clone().unwrap() }
+    } else {
+        next
+    };
     next.on_cpu.store(true, Ordering::Relaxed);
     next.state.store(RUNNING, Ordering::Relaxed);
     next.cpu.store(pc.id, Ordering::Relaxed);
@@ -268,6 +290,8 @@ pub fn idle_loop() -> ! {
     let pc = percpu::this();
     loop {
         arch::irq_disable();
+        pc.idle.store(true, Ordering::SeqCst);
+        core::sync::atomic::fence(Ordering::SeqCst);
         let has_work = !pc.rq.lock().is_empty() || pc.need_resched.load(Ordering::Relaxed);
         if has_work {
             pc.idle.store(false, Ordering::Relaxed);
@@ -277,11 +301,11 @@ pub fn idle_loop() -> ! {
         }
         // try to steal before sleeping
         if let Some(t) = steal(pc.id) {
+            pc.idle.store(false, Ordering::Relaxed);
             pc.rq.lock().push_back(t);
             arch::irq_enable();
             continue;
         }
-        pc.idle.store(true, Ordering::Relaxed);
         crate::time::idle_timer();
         arch::wait_for_interrupt();
         arch::irq_enable();
@@ -331,6 +355,7 @@ impl WaitQueue {
     /// signal is pending.
     pub fn wait_until(&self, mut cond: impl FnMut() -> bool, deadline: Option<u64>, interruptible: bool) -> WaitResult {
         let me = current_arc();
+        me.wchan.store(self as *const _ as usize | interruptible as usize, Ordering::Relaxed);
         let mut timer = None;
         let r = loop {
             {
@@ -466,5 +491,26 @@ impl<T: ?Sized> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
         *self.m.locked.lock() = false;
         self.m.wq.wake_one();
+    }
+}
+
+/// Prints every task (Ctrl-T on the console with ruxos.debug).
+pub fn dump_tasks() {
+    {
+        let n = crate::percpu::ncpus();
+        crate::arch::DUMP_PC.store((1 << n) - 1, Ordering::Relaxed);
+        for c in 0..n {
+            if c != crate::percpu::this().id {
+                arch::send_resched_ipi(c);
+            }
+        }
+    }
+    let tasks: alloc::vec::Vec<_> = crate::task::TASKS.lock().values().filter_map(|w| w.upgrade()).collect();
+    for t in tasks {
+        let st = ["running", "runnable", "sleeping", "dead"][t.state.load(Ordering::Relaxed) as usize];
+        let comm = crate::task::thread_of(&t).map(|th| *th.comm.lock()).unwrap_or_default();
+        let n = comm.iter().position(|&b| b == 0).unwrap_or(16);
+        let pc = crate::task::thread_of(&t).map(|th| unsafe { (*th.own.get()).frame }).filter(|f| !f.is_null()).map(|f| crate::arch::frame_pc(unsafe { &*f })).unwrap_or(0);
+        println!("task {} ({}) {} cpu {} wchan {:#x} user pc {:#x} last syscall {} of {}, {} faults, last at {:#x}", t.tid, core::str::from_utf8(&comm[..n]).unwrap_or("?"), st, t.cpu.load(Ordering::Relaxed), t.wchan.load(Ordering::Relaxed), pc, t.last_nr.load(Ordering::Relaxed), t.nr_count.load(Ordering::Relaxed), t.faults.load(Ordering::Relaxed), t.last_fault.load(Ordering::Relaxed));
     }
 }

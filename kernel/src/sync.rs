@@ -7,6 +7,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 pub struct SpinLock<T: ?Sized> {
     locked: AtomicBool,
+    /// Who holds it (debugging stuck locks): the caller's source location and CPU.
+    owner: core::sync::atomic::AtomicPtr<core::panic::Location<'static>>,
+    owner_cpu: core::sync::atomic::AtomicUsize,
     data: UnsafeCell<T>,
 }
 
@@ -20,24 +23,49 @@ pub struct SpinGuard<'a, T: ?Sized> {
 
 impl<T> SpinLock<T> {
     pub const fn new(v: T) -> Self {
-        SpinLock { locked: AtomicBool::new(false), data: UnsafeCell::new(v) }
+        SpinLock {
+            locked: AtomicBool::new(false),
+            owner: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+            owner_cpu: core::sync::atomic::AtomicUsize::new(0),
+            data: UnsafeCell::new(v),
+        }
     }
 }
 
 impl<T: ?Sized> SpinLock<T> {
+    #[track_caller]
     pub fn lock(&self) -> SpinGuard<'_, T> {
+        let caller = core::panic::Location::caller();
         let irq = crate::arch::irq_save();
+        let mut spins = 0u64;
         while self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             while self.locked.load(Ordering::Relaxed) {
                 core::hint::spin_loop();
+                spins += 1;
+                if spins == 500_000_000 {
+                    let o = self.owner.load(Ordering::Relaxed);
+                    if !o.is_null() {
+                        let o = unsafe { &*o };
+                        crate::console::print(format_args!(
+                            "ruxos: a spin lock seems stuck: wanted at {}:{}, held by cpu {} since {}:{}\n",
+                            caller.file(), caller.line(), self.owner_cpu.load(Ordering::Relaxed), o.file(), o.line()
+                        ));
+                    }
+                }
             }
+        }
+        self.owner.store(caller as *const _ as *mut _, Ordering::Relaxed);
+        if crate::arch::percpu_ptr() != 0 {
+            self.owner_cpu.store(crate::percpu::this().id, Ordering::Relaxed);
         }
         SpinGuard { lock: self, irq }
     }
 
+    #[track_caller]
     pub fn try_lock(&self) -> Option<SpinGuard<'_, T>> {
         let irq = crate::arch::irq_save();
         if self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            self.owner.store(core::panic::Location::caller() as *const _ as *mut _, Ordering::Relaxed);
             Some(SpinGuard { lock: self, irq })
         } else {
             crate::arch::irq_restore(irq);

@@ -60,6 +60,7 @@ pub fn wait(uaddr: usize, val: u32, deadline: Option<u64>, bitset: u32, private:
     }
     let (key, pa) = key_of(uaddr, private)?;
     let me = sched::current_arc();
+    me.wchan.store(0xf00, Ordering::Relaxed);
     let w = Arc::new(Waiter { key: SpinLock::new(key), task: me.clone(), bitset, woken: AtomicBool::new(false) });
     {
         let mut b = bucket(key).lock();

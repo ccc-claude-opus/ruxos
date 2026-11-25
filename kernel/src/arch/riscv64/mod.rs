@@ -254,12 +254,23 @@ fn handle_interrupt(cause: usize) {
     }
 }
 
+/// Debugging: CPUs asked to print where they were interrupted.
+pub static DUMP_PC: AtomicUsize = AtomicUsize::new(0);
+
+fn dump_pc(f: &TrapFrame, user: bool) {
+    let me = 1usize << crate::percpu::this().id;
+    if DUMP_PC.fetch_and(!me, Ordering::Relaxed) & me != 0 {
+        println!("cpu {} in {} at pc {:#x} ra {:#x}", crate::percpu::this().id, if user { "user mode" } else { "kernel" }, f.pc, f.x[1]);
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn trap_kernel(f: &mut TrapFrame) {
     let (cause, tval): (usize, usize);
     unsafe { asm!("csrr {}, scause", "csrr {}, stval", out(reg) cause, out(reg) tval) };
     if cause >> 63 != 0 {
         handle_interrupt(cause);
+        dump_pc(f, false);
         return;
     }
     panic!("kernel exception: scause {:#x} stval {:#x} sepc {:#x} ra {:#x} sp {:#x} s0 {:#x}", cause, tval, f.pc, f.x[1], f.x[2], f.x[8]);
@@ -271,6 +282,7 @@ extern "C" fn trap_user(f: &mut TrapFrame) -> ! {
     unsafe { asm!("csrr {}, scause", "csrr {}, stval", out(reg) cause, out(reg) tval) };
     if cause >> 63 != 0 {
         handle_interrupt(cause);
+        dump_pc(f, true);
         crate::trap::return_to_user(f);
     } else {
         irq_enable();
@@ -545,3 +557,6 @@ pub fn hwcap() -> (usize, usize) {
 
 pub const ELF_MACHINE: u16 = 243;
 pub const PLATFORM: &[u8] = b"riscv64";
+pub fn pte_user_executable(pte: usize) -> bool {
+    pte & (U | X) == U | X
+}

@@ -225,9 +225,16 @@ pub fn dt_irq(node: &crate::fdt::Node, i: usize) -> Option<u32> {
     Some(if kind == 0 { 32 + n } else { 16 + n })
 }
 
+/// Debugging: CPUs asked to print where they were interrupted.
+pub static DUMP_PC: AtomicUsize = AtomicUsize::new(0);
+
 #[unsafe(no_mangle)]
-extern "C" fn trap_irq(_f: &mut TrapFrame) {
+extern "C" fn trap_irq(f: &mut TrapFrame) {
     gic::handle_irqs();
+    let me = 1usize << crate::percpu::this().id;
+    if DUMP_PC.fetch_and(!me, Ordering::Relaxed) & me != 0 {
+        println!("cpu {} in kernel at pc {:#x} lr {:#x}", crate::percpu::this().id, f.pc, f.x[30]);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -255,6 +262,10 @@ extern "C" fn trap_el0_sync(f: &mut TrapFrame) {
 #[unsafe(no_mangle)]
 extern "C" fn trap_el0_irq(f: &mut TrapFrame) {
     gic::handle_irqs();
+    let me = 1usize << crate::percpu::this().id;
+    if DUMP_PC.fetch_and(!me, Ordering::Relaxed) & me != 0 {
+        println!("cpu {} in user mode at pc {:#x}", crate::percpu::this().id, f.pc);
+    }
     crate::trap::return_to_user(f);
 }
 
@@ -578,3 +589,6 @@ pub fn hwcap() -> (usize, usize) {
 
 pub const ELF_MACHINE: u16 = 183;
 pub const PLATFORM: &[u8] = b"aarch64";
+pub fn pte_user_executable(pte: usize) -> bool {
+    pte & (1 << 54) == 0 && pte_user_readable(pte)
+}

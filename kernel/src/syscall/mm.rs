@@ -36,8 +36,10 @@ pub fn mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, off: u64) -
         _ => return Err(EINVAL),
     };
     let mut file = None;
+    let mut fpath = None;
     if flags & MAP_ANONYMOUS == 0 {
         let f = super::fs::file(fd)?;
+        fpath = f.path.clone();
         let inode = f.inode().ok_or(ENODEV)?;
         let t = inode.stat()?.mode & S_IFMT;
         if t != S_IFREG && t != S_IFBLK && t != S_IFCHR {
@@ -80,7 +82,7 @@ pub fn mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, off: u64) -
             inner.find_free(len).ok_or(ENOMEM)?
         }
     };
-    inner.insert(Vma { start, end: start + len, prot, shared, file, offset: off, dontfork: false, kind: VmaKind::Normal });
+    inner.insert(Vma { start, end: start + len, prot, shared, file, offset: off, dontfork: false, kind: VmaKind::Normal, path: fpath });
     drop(inner);
     if flags & MAP_POPULATE != 0 {
         let mut va = start;
@@ -129,7 +131,7 @@ pub fn brk(addr: usize) -> Result<usize> {
         if !inner.is_free(old_end, new_end) {
             return Ok(cur);
         }
-        inner.insert(Vma { start: old_end, end: new_end, prot: PROT_READ | PROT_WRITE, shared: false, file: None, offset: 0, dontfork: false, kind: VmaKind::Heap });
+        inner.insert(Vma { start: old_end, end: new_end, prot: PROT_READ | PROT_WRITE, shared: false, file: None, offset: 0, dontfork: false, kind: VmaKind::Heap, path: None });
     } else if new_end < old_end {
         inner.unmap(&mm, new_end, old_end);
     }

@@ -256,6 +256,14 @@ fn kick(t: &Arc<Task>) {
     }
 }
 
+/// signalfds of the process see the new pending signal.
+fn notify_signalfds(proc: &Process) {
+    let qs: alloc::vec::Vec<_> = proc.signalfds.lock().iter().filter_map(|w| w.upgrade()).collect();
+    for q in qs {
+        q.notify(crate::vfs::poll::POLLIN);
+    }
+}
+
 pub fn send_thread(t: &Arc<Task>, info: SigInfo) {
     let Some(th) = thread_of(t) else { return };
     on_send(&th.proc, info.signo);
@@ -263,6 +271,7 @@ pub fn send_thread(t: &Arc<Task>, info: SigInfo) {
         return;
     }
     th.pending.lock().add(info);
+    notify_signalfds(&th.proc);
     kick(t);
 }
 
@@ -279,6 +288,7 @@ pub fn send_process(proc: &Arc<Process>, info: SigInfo) {
         proc.group_exit_code.store(SIGKILL as i32, Ordering::SeqCst);
     }
     proc.pending.lock().add(info);
+    notify_signalfds(proc);
     // wake a thread that does not block it (all of them for SIGKILL)
     for t in &threads {
         let blocked = thread_of(t).map_or(0, |th| th.sigmask.load(Ordering::Relaxed) as u64);

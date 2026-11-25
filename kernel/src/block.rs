@@ -15,6 +15,25 @@ pub trait BlockDevice: Send + Sync {
     fn readonly(&self) -> bool {
         false
     }
+    /// Reads into (physical address, length) buffers (page cache pages).
+    fn read_phys(&self, sector: u64, pages: &[(usize, usize)]) -> Result<()> {
+        let mut s = sector;
+        for &(pa, len) in pages {
+            let b = unsafe { core::slice::from_raw_parts_mut(crate::arch::phys_to_virt(pa) as *mut u8, len) };
+            self.read(s, b)?;
+            s += len as u64 / 512;
+        }
+        Ok(())
+    }
+    fn write_phys(&self, sector: u64, pages: &[(usize, usize)]) -> Result<()> {
+        let mut s = sector;
+        for &(pa, len) in pages {
+            let b = unsafe { core::slice::from_raw_parts(crate::arch::phys_to_virt(pa) as *const u8, len) };
+            self.write(s, b)?;
+            s += len as u64 / 512;
+        }
+        Ok(())
+    }
 }
 
 /// /dev/vdX opened directly (mkfs, fsck, blkid): byte-addressed reads and writes.

@@ -216,8 +216,8 @@ pub fn map(mm: &Arc<Mm>) -> Result<usize> {
     let v = VDSO.get().ok_or(ENOSYS)?;
     let mut inner = mm.inner.lock();
     let at = inner.find_free(2 * PAGE_SIZE).ok_or(ENOMEM)?;
-    inner.insert(Vma { start: at, end: at + PAGE_SIZE, prot: PROT_READ, shared: true, file: None, offset: 0, dontfork: false, kind: VmaKind::Vvar });
-    inner.insert(Vma { start: at + PAGE_SIZE, end: at + 2 * PAGE_SIZE, prot: PROT_READ | PROT_EXEC, shared: true, file: None, offset: 0, dontfork: false, kind: VmaKind::Vdso });
+    inner.insert(Vma { start: at, end: at + PAGE_SIZE, prot: PROT_READ, shared: true, file: None, offset: 0, dontfork: false, kind: VmaKind::Vvar, path: None });
+    inner.insert(Vma { start: at + PAGE_SIZE, end: at + 2 * PAGE_SIZE, prot: PROT_READ | PROT_EXEC, shared: true, file: None, offset: 0, dontfork: false, kind: VmaKind::Vdso, path: None });
     for (va, pa, x) in [(at, v.vvar, false), (at + PAGE_SIZE, v.image, true)] {
         frame::get_page(pa);
         *mm.pte(va, true).ok_or(ENOMEM)? = arch::pte_user(pa, true, false, x);

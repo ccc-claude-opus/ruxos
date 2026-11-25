@@ -120,6 +120,10 @@ impl Tty {
 
     /// One byte from the UART.
     pub fn receive(&self, mut c: u8) {
+        if c == 0x14 && crate::kernel_param("ruxos.debug").is_some() {
+            crate::sched::dump_tasks();
+            return;
+        }
         let mut sig = None;
         {
             let mut i = self.input.lock();

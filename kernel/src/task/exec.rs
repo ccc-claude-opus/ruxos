@@ -92,7 +92,7 @@ fn open_exec(path: &[u8], at: &PathRef) -> Result<(PathRef, Arc<dyn Inode>)> {
 
 /// Maps the PT_LOAD segments of `elf` at `bias` into the current (new) address space. Returns the
 /// end of the highest segment.
-fn map_segments(mm: &Arc<Mm>, inode: &Arc<dyn Inode>, elf: &Elf, bias: usize) -> Result<usize> {
+fn map_segments(mm: &Arc<Mm>, inode: &Arc<dyn Inode>, path: &PathRef, elf: &Elf, bias: usize) -> Result<usize> {
     let mut end = 0;
     for ph in elf.phdrs.iter().filter(|p| p.p_type == PT_LOAD && p.memsz > 0) {
         let prot = (if ph.flags & 4 != 0 { PROT_READ } else { 0 })
@@ -118,12 +118,13 @@ fn map_segments(mm: &Arc<Mm>, inode: &Arc<dyn Inode>, elf: &Elf, bias: usize) ->
                     offset: off,
                     dontfork: false,
                     kind: VmaKind::Normal,
+                    path: Some(path.clone()),
                 });
             }
             let anon_start = if ph.filesz > 0 { file_page_end } else { start };
             if mem_page_end > anon_start {
                 inner.unmap(mm, anon_start, mem_page_end);
-                inner.insert(Vma { start: anon_start, end: mem_page_end, prot, shared: false, file: None, offset: 0, dontfork: false, kind: VmaKind::Normal });
+                inner.insert(Vma { start: anon_start, end: mem_page_end, prot, shared: false, file: None, offset: 0, dontfork: false, kind: VmaKind::Normal, path: None });
             }
         }
         // the part of the last file page past p_filesz is .bss: zero it
@@ -238,11 +239,11 @@ pub fn execve(path: &[u8], argv: Vec<Vec<u8>>, envp: Vec<Vec<u8>>, at: &PathRef,
         while name.last() == Some(&0) {
             name.pop();
         }
-        let (_, ii) = open_exec(&name, at)?;
+        let (ipath, ii) = open_exec(&name, at)?;
         let mut h = alloc::vec![0u8; 64];
         ii.read_at(0, &mut h)?;
         let ie = parse_elf(&ii, &h)?;
-        interp = Some((ii, ie));
+        interp = Some((ii, ie, ipath));
     }
 
     // ---- point of no return: a new address space
@@ -256,7 +257,7 @@ pub fn execve(path: &[u8], argv: Vec<Vec<u8>>, envp: Vec<Vec<u8>>, at: &PathRef,
         inner.stack_top = stack_top;
         inner.mmap_top = stack_top - stack_lim.max(128 << 20) - (16 << 20);
         inner.exe = Some(file.clone());
-        inner.insert(Vma { start: stack_top - stack_lim, end: stack_top, prot: PROT_READ | PROT_WRITE, shared: false, file: None, offset: 0, dontfork: false, kind: VmaKind::Stack });
+        inner.insert(Vma { start: stack_top - stack_lim, end: stack_top, prot: PROT_READ | PROT_WRITE, shared: false, file: None, offset: 0, dontfork: false, kind: VmaKind::Stack, path: None });
     }
     switch_mm(mm.clone());
     let fail = |_e: Errno| -> ! {
@@ -264,11 +265,11 @@ pub fn execve(path: &[u8], argv: Vec<Vec<u8>>, envp: Vec<Vec<u8>>, at: &PathRef,
         super::exit(status, true)
     };
     let bias = load_bias(&elf, &mm, true).unwrap_or_else(|e| fail(e));
-    let end = map_segments(&mm, &inode, &elf, bias).unwrap_or_else(|e| fail(e));
+    let end = map_segments(&mm, &inode, &file, &elf, bias).unwrap_or_else(|e| fail(e));
     let (entry, base) = match &interp {
-        Some((ii, ie)) => {
+        Some((ii, ie, ip)) => {
             let ib = load_bias(ie, &mm, false).unwrap_or_else(|e| fail(e));
-            map_segments(&mm, ii, ie, ib).unwrap_or_else(|e| fail(e));
+            map_segments(&mm, ii, ip, ie, ib).unwrap_or_else(|e| fail(e));
             (ib + ie.entry as usize, ib)
         }
         None => (bias + elf.entry as usize, 0),

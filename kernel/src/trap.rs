@@ -17,6 +17,9 @@ pub fn user_exception(f: &mut TrapFrame, cause: usize, addr: usize) {
                 f.pc += 4;
             }
             let nr = arch::syscall_nr(f);
+            let me = crate::sched::current();
+            me.last_nr.store(nr, core::sync::atomic::Ordering::Relaxed);
+            me.nr_count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let args = arch::syscall_args(f);
             o.orig_arg0 = args[0];
             let r = crate::syscall::dispatch(nr, args, f);
@@ -25,7 +28,12 @@ pub fn user_exception(f: &mut TrapFrame, cause: usize, addr: usize) {
                 own().in_syscall = true;
             }
         }
-        UserTrap::PageFault(va, access) => match current_mm().fault(va, access) {
+        UserTrap::PageFault(va, access) => match {
+            let me = crate::sched::current();
+            me.faults.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            me.last_fault.store(va, core::sync::atomic::Ordering::Relaxed);
+            current_mm().fault(va, access)
+        } {
             Ok(()) => {}
             Err(e) => {
                 if crate::syscall::STRACE.load(core::sync::atomic::Ordering::Relaxed) {

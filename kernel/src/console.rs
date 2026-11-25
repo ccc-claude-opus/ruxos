@@ -72,8 +72,31 @@ impl Write for Console {
     }
 }
 
+static LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+
 pub fn print(args: fmt::Arguments) {
+    // one message at a time (unless a panic interrupted someone holding the lock)
+    let g = LOCK.try_lock().or_else(|| {
+        for _ in 0..1_000_000 {
+            if let Some(g) = LOCK.try_lock() {
+                return Some(g);
+            }
+            core::hint::spin_loop();
+        }
+        None
+    });
     let _ = Console.write_fmt(args);
+    drop(g);
+}
+
+/// For the lock watchdog: prints a number without taking the print lock.
+pub fn write_hex(v: usize) {
+    write_bytes(b"  at ");
+    for i in (0..16).rev() {
+        let d = (v >> (4 * i)) & 0xf;
+        putc(if d < 10 { b'0' + d as u8 } else { b'a' + d as u8 - 10 });
+    }
+    write_bytes(b"\n");
 }
 
 #[allow(unused_macros)]

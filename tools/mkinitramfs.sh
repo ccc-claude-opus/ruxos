@@ -13,4 +13,14 @@ gunzip -c "$ruvm/tests/guest/out/linux/root/$deb/initramfs.cpio.gz" | (cd "$work
 cp tests/initramfs/init "$work/init"
 # the ABI tests, static (musl), built with zig cc
 zig cc -target $arch-linux-musl -static -O2 -o "$work/bin/abi" tests/abi/abi.c
+# a glibc sysroot (Debian libc6 + dash, from ruvm's tools/linux/fetch-sysroot.sh) with the same tests
+# linked dynamically against glibc
+sysroot=$ruvm/tests/guest/out/user/$deb/sysroot
+if [ -d "$sysroot" ]; then
+    cp -a "$sysroot" "$work/sysroot"
+    mkdir -p "$work/sysroot/proc" "$work/sysroot/tmp" "$work/sysroot/dev"
+    zig cc -target $arch-linux-gnu.2.36 -O2 -o "$work/sysroot/abi" tests/abi/abi.c -lpthread
+fi
+mkdir -p "$work/tests"
+cp tests/node/*.js "$work/tests/"
 (cd "$work" && find . | LC_ALL=C sort | cpio -o --quiet -H newc) | gzip -9 > out/$arch/test-initramfs.cpio.gz

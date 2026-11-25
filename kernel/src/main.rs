@@ -9,6 +9,7 @@ extern crate alloc;
 mod console;
 mod arch;
 mod block;
+mod drivers;
 mod errno;
 mod fdt;
 mod fs;
@@ -16,6 +17,7 @@ mod futex;
 mod irq;
 mod locks;
 mod mm;
+mod net;
 mod percpu;
 mod power;
 mod random;
@@ -149,6 +151,7 @@ extern "C" fn kernel_init(_: usize) {
     random::init(&fdt);
     vfs::dev::init();
     tty::init(&fdt);
+    drivers::virtio::init(&fdt);
     vdso::init();
 
     // the root file system: the initramfs in a tmpfs, else root=
