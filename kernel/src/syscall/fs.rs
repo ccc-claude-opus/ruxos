@@ -124,14 +124,14 @@ pub fn open_path(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<F
     let inode = p.inode()?;
     let stat = inode.stat()?;
     let ftype = stat.mode & S_IFMT;
+    if flags & O_DIRECTORY != 0 && ftype != S_IFDIR {
+        return Err(ENOTDIR);
+    }
     if flags & O_PATH != 0 {
         return Ok(File::new(ops_for(&inode, flags)?, flags, Some(p)));
     }
     if ftype == S_IFLNK {
         return Err(ELOOP);
-    }
-    if flags & O_DIRECTORY != 0 && ftype != S_IFDIR {
-        return Err(ENOTDIR);
     }
     let acc = flags & O_ACCMODE;
     if ftype == S_IFDIR && (acc != O_RDONLY || flags & O_TRUNC != 0) {

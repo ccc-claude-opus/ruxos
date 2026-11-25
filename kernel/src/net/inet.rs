@@ -146,7 +146,8 @@ extern "C" fn net_thread(_: usize) {
                 None => None,
             }
         };
-        let d = delay.unwrap_or(Duration::from_millis(1000)).total_micros().min(1_000_000);
+        // at least 1 ms: smoltcp may ask for "now" again while nothing can progress
+        let d = delay.unwrap_or(Duration::from_millis(1000)).total_micros().clamp(1000, 1_000_000);
         let deadline = crate::arch::ticks() + crate::time::ns_to_ticks(d * 1000);
         NET_WQ.wait_until(|| KICKED.load(Ordering::Acquire), Some(deadline), false);
     }
@@ -422,13 +423,15 @@ impl Socket for InetSocket {
             *self.local.lock() = Some(Sin { ip: [0; 4], port: ephemeral() });
         }
         let l = self.local.lock().unwrap();
-        let mut st = self.st.lock();
-        if let State::Listening { max, .. } = &mut *st {
-            *max = backlog.clamp(1, 4096) as usize;
-            return Ok(());
-        }
-        if !matches!(*st, State::Fresh) {
-            return Err(EINVAL);
+        match self.view() {
+            View::Listening => {
+                if let State::Listening { max, .. } = &mut *self.st.lock() {
+                    *max = backlog.clamp(1, 4096) as usize;
+                }
+                return Ok(());
+            }
+            View::Fresh => {}
+            _ => return Err(EINVAL),
         }
         // from other hosts: smoltcp listeners on eth0 (unless bound to loopback only)
         let mut pool = Vec::new();
@@ -441,10 +444,13 @@ impl Socket for InetSocket {
                     self.own(s, h);
                     pool.push(h);
                 }
+                *self.st.lock() = State::Listening { backlog: VecDeque::new(), max: backlog.clamp(1, 4096) as usize, pool };
+            } else {
+                *self.st.lock() = State::Listening { backlog: VecDeque::new(), max: backlog.clamp(1, 4096) as usize, pool };
             }
+        } else {
+            *self.st.lock() = State::Listening { backlog: VecDeque::new(), max: backlog.clamp(1, 4096) as usize, pool };
         }
-        *st = State::Listening { backlog: VecDeque::new(), max: backlog.clamp(1, 4096) as usize, pool };
-        drop(st);
         LISTENERS.lock().entry(l.port).or_default().push(self.me.clone());
         kick();
         Ok(())
@@ -562,12 +568,9 @@ impl Socket for InetSocket {
         if self.shut_wr.load(Ordering::Relaxed) {
             return Err(EPIPE);
         }
-        let h = match &*self.st.lock() {
-            State::Local { end } => {
-                let e = end.clone();
-                return e.send(Msg { data: msg.data, ..Default::default() }, flags | MSG_NOSIGNAL, nonblock).map_err(|e| self.epipe(e, flags));
-            }
-            State::Tcp { h } => *h,
+        let h = match self.view() {
+            View::Local(e) => return e.send(Msg { data: msg.data, ..Default::default() }, flags | MSG_NOSIGNAL, nonblock).map_err(|e| self.epipe(e, flags)),
+            View::Tcp(h) => h,
             _ => return Err(ENOTCONN),
         };
         let data = msg.data;
@@ -604,12 +607,9 @@ impl Socket for InetSocket {
         if self.ty == SOCK_DGRAM {
             return self.recv_udp(len, flags, nonblock);
         }
-        let h = match &*self.st.lock() {
-            State::Local { end } => {
-                let e = end.clone();
-                return e.recv(len, flags, nonblock);
-            }
-            State::Tcp { h } => *h,
+        let h = match self.view() {
+            View::Local(e) => return e.recv(len, flags, nonblock),
+            View::Tcp(h) => h,
             _ => return Err(ENOTCONN),
         };
         loop {
@@ -646,22 +646,17 @@ impl Socket for InetSocket {
     }
 
     fn shutdown(&self, how: u32) -> Result<()> {
-        match &*self.st.lock() {
-            State::Local { end } => return end.shutdown(how),
-            State::Tcp { .. } => {
+        match self.view() {
+            View::Local(end) => return end.shutdown(how),
+            View::Tcp(h) => {
                 if how != 0 {
                     self.shut_wr.store(true, Ordering::Relaxed);
+                    self.tcp(h, |t| t.close());
+                    kick();
                 }
             }
-            State::Listening { .. } | State::Udp { .. } | State::Fresh => return if self.ty == SOCK_DGRAM { Ok(()) } else { Err(ENOTCONN) },
-            State::Closed => return Err(ENOTCONN),
-        }
-        if how != 0 {
-            if let State::Tcp { h } = &*self.st.lock() {
-                let h = *h;
-                self.tcp(h, |t| t.close());
-            }
-            kick();
+            View::Closed => return Err(ENOTCONN),
+            _ => return if self.ty == SOCK_DGRAM { Ok(()) } else { Err(ENOTCONN) },
         }
         self.pq.notify(POLLIN | POLLOUT);
         Ok(())
@@ -684,16 +679,14 @@ impl Socket for InetSocket {
             (SOL_SOCKET, SO_REUSEADDR) | (SOL_SOCKET, 15) => self.reuse.store(v != 0, Ordering::Relaxed),
             (SOL_SOCKET, SO_KEEPALIVE) => {
                 self.keepalive.store(v != 0, Ordering::Relaxed);
-                if let State::Tcp { h } = &*self.st.lock() {
-                    let h = *h;
+                if let View::Tcp(h) = self.view() {
                     self.tcp(h, |t| t.set_keep_alive(if v != 0 { Some(Duration::from_secs(60)) } else { None }));
                 }
             }
             (6, 1) => {
                 // TCP_NODELAY
                 self.nodelay.store(v != 0, Ordering::Relaxed);
-                if let State::Tcp { h } = &*self.st.lock() {
-                    let h = *h;
+                if let View::Tcp(h) = self.view() {
                     self.tcp(h, |t| t.set_nagle_enabled(v == 0));
                 }
             }
@@ -720,16 +713,14 @@ impl Socket for InetSocket {
     }
 
     fn poll(&self) -> u32 {
-        let st = self.st.lock();
-        match &*st {
-            State::Listening { backlog, .. } => {
-                if backlog.is_empty() { 0 } else { POLLIN | POLLRDNORM }
-            }
-            State::Local { end } => end.poll(),
-            State::Tcp { h } => {
-                let h = *h;
-                drop(st);
-                self.tcp(h, |t| {
+        match self.view() {
+            View::Listening => match &*self.st.lock() {
+                State::Listening { backlog, .. } if !backlog.is_empty() => POLLIN | POLLRDNORM,
+                _ => 0,
+            },
+            View::Local(end) => end.poll(),
+            View::Tcp(h) => self
+                .tcp(h, |t| {
                     let mut ev = 0;
                     if t.can_recv() {
                         ev |= POLLIN | POLLRDNORM;
@@ -741,33 +732,29 @@ impl Socket for InetSocket {
                         ev |= POLLOUT | POLLWRNORM;
                     }
                     if t.state() == tcp::State::Closed {
-                        ev |= POLLHUP | if t.remote_endpoint().is_none() { 0 } else { 0 };
-                        ev |= POLLOUT | POLLERR;
+                        ev |= POLLHUP | POLLOUT | POLLERR;
                         if self.error.load(Ordering::Relaxed) == 0 {
                             self.error.store(ECONNRESET.0 as u32, Ordering::Relaxed);
                         }
                     }
                     ev
                 })
-                .unwrap_or(POLLERR)
-            }
-            State::Udp { h } => {
-                let h = *h;
-                drop(st);
+                .unwrap_or(POLLERR),
+            View::Udp(h) => {
                 let mut ev = POLLOUT | POLLWRNORM;
                 if !self.udp_rx.lock().is_empty() || h.is_some_and(|h| STACK.lock().as_mut().is_some_and(|s| s.sockets.get_mut::<udp::Socket>(h).can_recv())) {
                     ev |= POLLIN | POLLRDNORM;
                 }
                 ev
             }
-            State::Fresh => {
+            View::Fresh => {
                 if self.ty == SOCK_DGRAM {
                     POLLOUT | if self.udp_rx.lock().is_empty() { 0 } else { POLLIN }
                 } else {
                     POLLOUT | POLLHUP
                 }
             }
-            State::Closed => POLLHUP,
+            View::Closed => POLLHUP,
         }
     }
 
@@ -777,14 +764,13 @@ impl Socket for InetSocket {
 
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<isize> {
         if cmd == 0x541b {
-            let n = match &*self.st.lock() {
-                State::Local { end } => {
-                    let e = end.clone();
-                    return e.ioctl(cmd, arg);
-                }
-                State::Tcp { h } => {
-                    let h = *h;
-                    self.tcp(h, |t| t.recv_queue()).unwrap_or(0)
+            let n = match self.view() {
+                View::Local(e) => return e.ioctl(cmd, arg),
+                View::Tcp(h) => self.tcp(h, |t| t.recv_queue()).unwrap_or(0),
+                View::Udp(h) => {
+                    let local = self.udp_rx.lock().front().map(|d| d.1.len());
+                    // the size of the next datagram (what FIONREAD means for UDP)
+                    local.or_else(|| h.and_then(|h| STACK.lock().as_mut().and_then(|s| s.sockets.get_mut::<udp::Socket>(h).peek().ok().map(|(d, _)| d.len())))).unwrap_or(0)
                 }
                 _ => self.udp_rx.lock().front().map_or(0, |d| d.1.len()),
             };
@@ -822,7 +808,29 @@ fn relay(end: &Arc<UnixSocket>, to: &Weak<InetSocket>) {
 
 static RELAYS: SpinLock<Vec<Arc<dyn Watcher>>> = SpinLock::new(Vec::new());
 
+/// A copy of the socket's state, taken without holding its lock (the lock order is STACK, then
+/// st; nothing may sleep or take STACK while holding st).
+enum View {
+    Fresh,
+    Listening,
+    Local(Arc<UnixSocket>),
+    Tcp(SocketHandle),
+    Udp(Option<SocketHandle>),
+    Closed,
+}
+
 impl InetSocket {
+    fn view(&self) -> View {
+        match &*self.st.lock() {
+            State::Fresh => View::Fresh,
+            State::Listening { .. } => View::Listening,
+            State::Local { end } => View::Local(end.clone()),
+            State::Tcp { h } => View::Tcp(*h),
+            State::Udp { h } => View::Udp(*h),
+            State::Closed => View::Closed,
+        }
+    }
+
     fn local_end(&self) -> Option<Arc<UnixSocket>> {
         match &*self.st.lock() {
             State::Local { end } => Some(end.clone()),

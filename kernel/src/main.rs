@@ -178,13 +178,28 @@ extern "C" fn kernel_init(_: usize) {
         }
     };
     let root = vfs::PathRef { mnt: root_mnt.clone(), d: root_mnt.root.clone() };
+    let from_disk = fdt.initrd().filter(|r| r.1 > r.0).is_none();
     task::make_init(root);
+    if from_disk {
+        // like Linux with CONFIG_DEVTMPFS_MOUNT: devtmpfs on the root file system's /dev
+        if let Ok(dev) = syscall::fs::lookup_at(-100, b"/dev", true, false) {
+            let fs: alloc::sync::Arc<dyn vfs::FileSystem> = vfs::dev::DEVTMPFS.clone();
+            let m = vfs::Mount::new(vfs::path::DEntry::new_root(fs), 0, "devtmpfs", "devtmpfs", "");
+            dev.mnt.attach(&dev.d, &m);
+        }
+    }
     if kernel_param("ruxos.strace").is_some() {
         syscall::STRACE.store(true, Ordering::Relaxed);
     }
 
     // fds 0, 1, 2: /dev/console
-    let console = syscall::fs::open_path(-100, b"/dev/console", vfs::file::O_RDWR, 0).or_else(|_| {
+    let console = syscall::fs::open_path(-100, b"/dev/console", vfs::file::O_RDWR, 0)
+        .and_then(|f| {
+            // only the real device (a root file system may have a placeholder file there)
+            let chr = f.inode().and_then(|i| i.stat().ok()).is_some_and(|s| s.mode & vfs::S_IFMT == vfs::S_IFCHR);
+            if chr { Ok(f) } else { Err(errno::ENODEV) }
+        })
+        .or_else(|_| {
         let i = vfs::FileSystem::root(&**vfs::dev::DEVTMPFS).lookup(b"console")?;
         Ok::<_, errno::Errno>(vfs::File::with_node(vfs::file::ops_for(&i, vfs::file::O_RDWR)?, vfs::file::O_RDWR, None, Some(i)))
     });
