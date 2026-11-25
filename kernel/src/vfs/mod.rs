@@ -111,6 +111,10 @@ pub trait FileSystem: Send + Sync {
     fn sync(&self) -> Result<()> {
         Ok(())
     }
+    /// The last mount went away (umount, or power off): write everything and mark it clean.
+    fn unmount(&self) -> Result<()> {
+        self.sync()
+    }
     /// Whether lookups may be cached in dentries (false for /proc and /sys, whose contents change).
     fn cache_dentries(&self) -> bool {
         true

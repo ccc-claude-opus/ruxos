@@ -1092,6 +1092,9 @@ pub fn mount(src: usize, target: usize, fstype: usize, flags: u64, data: usize) 
             return Err(EINVAL);
         }
         m.flags.store(mnt_flags(flags), core::sync::atomic::Ordering::Relaxed);
+        if flags & MS_RDONLY != 0 {
+            m.root.fs.unmount()?;
+        }
         return Ok(0);
     }
     if flags & MS_MOVE != 0 {
@@ -1155,7 +1158,10 @@ pub fn umount2(target: usize, flags: u32) -> Result<usize> {
     if flags & 2 == 0 && !p.mnt.children.lock().is_empty() {
         return Err(EBUSY);
     }
-    let _ = p.d.fs.sync();
     p.mnt.detach();
+    // the file system is no longer mounted anywhere: flush it and mark it clean
+    if !crate::fs::is_mounted(&p.d.fs) {
+        p.d.fs.unmount()?;
+    }
     Ok(0)
 }

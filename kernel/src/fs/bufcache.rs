@@ -59,6 +59,10 @@ impl BufCache {
         b
     }
 
+    pub fn forget_all(&self) {
+        self.map.lock().clear();
+    }
+
     pub fn forget(&self, block: u64) {
         self.map.lock().remove(&block);
     }

@@ -51,6 +51,46 @@ if [ -b /dev/vda ]; then
         [ -x /mnt/bin/busybox ] && [ "$(chroot /mnt /bin/busybox echo hi)" = hi ] || fail ext4-exec
     fi
 fi
+# power-cut test: write forever (the host kills the VM), or mount once to replay the journal
+if [ -b /dev/vdb ] && [ -n "$ext4crash" ]; then
+    mkdir -p /data
+    mount -t ext4 /dev/vdb /data || fail mount-crash
+    if [ "$ext4crash" = write ]; then
+        echo "ruxos-test crash: writing"
+        n=0
+        while :; do
+            mkdir -p /data/c$((n % 7))
+            echo "$n" > /data/c$((n % 7))/f$n
+            [ $((n % 5)) = 0 ] && rm -f /data/c$((n % 7))/f$((n - 5))
+            [ $((n % 50)) = 0 ] && sync
+            n=$((n + 1))
+        done
+    fi
+    umount /data || fail umount-crash
+    echo "ruxos-test crash: ok"
+    poweroff -f
+fi
+# ext4 writes on the scratch disk (/dev/vdb, formatted by the host; checked with e2fsck afterwards)
+if [ -b /dev/vdb ] && [ -n "$ext4rw" ]; then
+    mkdir -p /data
+    mount -t ext4 /dev/vdb /data || fail mount-rw
+    mkdir -p /data/d1/d2 || fail mkdir
+    i=1; while [ $i -le 300 ]; do echo "file $i" > /data/d1/f$i; i=$((i + 1)); done
+    dd if=/dev/zero of=/data/big bs=65536 count=256 2>/dev/null || fail big-write
+    ln /data/d1/f1 /data/hard && ln -s d1/f2 /data/sym || fail links
+    mv /data/d1/f3 /data/d1/d2/g3 && rm /data/d1/f4 && rmdir /data/d1/d2 2>/dev/null
+    [ -d /data/d1/d2 ] || fail rmdir-nonempty
+    printf '%s' abc > /data/t; printf '%s' def >> /data/t
+    [ "$(cat /data/t)" = abcdef ] || fail append
+    [ "$(cat /data/sym)" = "file 2" ] && [ "$(cat /data/hard)" = "file 1" ] || fail link-read
+    sync
+    umount /data || fail umount
+    mount -t ext4 /dev/vdb /data || fail remount
+    [ "$(cat /data/d1/d2/g3)" = "file 3" ] && [ ! -e /data/d1/f4 ] && [ "$(ls /data/d1 | wc -l)" = 299 ] || fail persist
+    [ "$(wc -c < /data/big)" = 16777216 ] || fail big-size
+    [ -n "$keep" ] || rm -r /data/d1 /data/big
+    umount /data || fail umount2
+fi
 uname -a
 echo "ruxos-test m2: ok"
 poweroff -f

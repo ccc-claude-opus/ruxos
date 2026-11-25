@@ -23,7 +23,46 @@ pub fn make_fs(fstype: &[u8], _source: &[u8], _data: &[u8], _ro: bool) -> Result
     }
 }
 
-pub fn sync_all() {}
+/// Every mount of the mount tree (from init's root).
+fn all_mounts() -> alloc::vec::Vec<Arc<crate::vfs::Mount>> {
+    let mut out = alloc::vec::Vec::new();
+    let Some(init) = crate::task::INIT.get() else { return out };
+    let Some(leader) = init.leader() else { return out };
+    let Some(th) = crate::task::thread_of(&leader) else { return out };
+    let mut root = th.fs.lock().root.mnt.clone();
+    loop {
+        let parent = root.parent.lock().clone();
+        match parent {
+            Some((p, _)) => root = p,
+            None => break,
+        }
+    }
+    fn walk(m: &Arc<crate::vfs::Mount>, out: &mut alloc::vec::Vec<Arc<crate::vfs::Mount>>) {
+        out.push(m.clone());
+        for c in m.children.lock().clone() {
+            walk(&c, out);
+        }
+    }
+    walk(&root, &mut out);
+    out
+}
+
+pub fn is_mounted(fs: &Arc<dyn FileSystem>) -> bool {
+    all_mounts().iter().any(|m| core::ptr::addr_eq(Arc::as_ptr(&m.root.fs), Arc::as_ptr(fs)))
+}
+
+pub fn sync_all() {
+    for m in all_mounts() {
+        let _ = m.root.fs.sync();
+    }
+}
+
+/// Power off: every file system written out and marked clean.
+pub fn unmount_all() {
+    for m in all_mounts().iter().rev() {
+        let _ = m.root.fs.unmount();
+    }
+}
 
 /// The block device a path names (/dev/vda...).
 fn block_dev_by_path(p: &[u8]) -> Result<(Arc<dyn crate::block::BlockDevice>, u64)> {

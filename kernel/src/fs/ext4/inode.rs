@@ -25,6 +25,11 @@ pub struct Ext4Inode {
     pub cache: PageCache,
     /// Serializes changes to this inode's data and directory entries.
     pub lock: Mutex<()>,
+    pub me: alloc::sync::Weak<Ext4Inode>,
+    /// The raw inode changed since it was written to the inode table.
+    pub dirty: core::sync::atomic::AtomicBool,
+    /// Page-cache pages written since the last writeback.
+    pub dirty_pages: SpinLock<alloc::collections::BTreeSet<u64>>,
 }
 
 fn ts(sec: u32, extra: u32) -> Timespec {
@@ -39,7 +44,20 @@ impl Ext4Inode {
         let isz = fs.sb.lock().inode_size;
         let b = fs.bufs.get(blk)?;
         let raw = b.read(|d| d[off..off + isz].to_vec());
-        Ok(Arc::new(Ext4Inode { fs, ino, raw: SpinLock::new(raw), cache: PageCache::new(), lock: Mutex::new(()) }))
+        Ok(Self::from_raw(fs, ino, raw))
+    }
+
+    pub fn from_raw(fs: Arc<Ext4>, ino: u32, raw: Vec<u8>) -> Arc<Ext4Inode> {
+        Arc::new_cyclic(|me| Ext4Inode {
+            fs,
+            ino,
+            raw: SpinLock::new(raw),
+            cache: PageCache::new(),
+            lock: Mutex::new(()),
+            me: me.clone(),
+            dirty: core::sync::atomic::AtomicBool::new(false),
+            dirty_pages: SpinLock::new(alloc::collections::BTreeSet::new()),
+        })
     }
 
     pub fn mode(&self) -> u32 {
@@ -253,8 +271,68 @@ impl Inode for Ext4Inode {
         Ok(n)
     }
 
-    fn write_at(&self, _off: u64, _buf: &[u8]) -> Result<usize> {
-        Err(EROFS)
+    fn write_at(&self, off: u64, buf: &[u8]) -> Result<usize> {
+        if self.is_dir() {
+            return Err(EISDIR);
+        }
+        self.do_write(off, buf)
+    }
+
+    fn setattr(&self, a: &SetAttr) -> Result<()> {
+        if self.fs.ro {
+            return Err(EROFS);
+        }
+        let _g = self.fs.wlock.lock();
+        if let Some(size) = a.size {
+            self.do_truncate(size)?;
+        }
+        self.apply_attr(a);
+        Ok(())
+    }
+
+    fn fsync(&self, _datasync: bool) -> Result<()> {
+        self.fs.commit()
+    }
+
+    fn page_mkwrite(&self, index: u64) {
+        self.dirty_pages.lock().insert(index);
+        self.fs.note_dirty_data(self);
+    }
+
+    fn fallocate(&self, mode: u32, off: u64, len: u64) -> Result<()> {
+        if mode != 0 {
+            return Err(EOPNOTSUPP);
+        }
+        // the size grows; blocks are allocated when data is written
+        if off + len > self.size() {
+            let _g = self.lock.lock();
+            self.set_size(off + len);
+        }
+        Ok(())
+    }
+
+    fn create(&self, name: &[u8], mode: u32, rdev: u64, uid: u32, gid: u32) -> Result<Arc<dyn Inode>> {
+        Ok(self.op_create(name, mode, rdev, uid, gid, None)?)
+    }
+
+    fn symlink(&self, name: &[u8], target: &[u8], uid: u32, gid: u32) -> Result<Arc<dyn Inode>> {
+        Ok(self.op_create(name, S_IFLNK | 0o777, 0, uid, gid, Some(target))?)
+    }
+
+    fn link(&self, name: &[u8], target: &Arc<dyn Inode>) -> Result<()> {
+        self.op_link(name, target)
+    }
+
+    fn unlink(&self, name: &[u8]) -> Result<()> {
+        self.op_unlink(name, false)
+    }
+
+    fn rmdir(&self, name: &[u8]) -> Result<()> {
+        self.op_unlink(name, true)
+    }
+
+    fn rename(&self, old: &[u8], newdir: &Arc<dyn Inode>, new: &[u8], flags: u32) -> Result<()> {
+        self.op_rename(old, newdir, new, flags)
     }
 
     fn get_page(&self, index: u64) -> Result<usize> {

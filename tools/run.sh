@@ -1,8 +1,9 @@
 #!/bin/sh
 # Boots ruxos in ruvm.
 #   tools/run.sh [aarch64|riscv64] [--accel hvf|kvm|tcg] [--smp N] [-m MB] [--qemu] [-- extra ruvm args]
-# aarch64 defaults to the ruwebos disks (../ruwebos/out/system.ext4, data.ext4) and -accel hvf on an
-# Apple Silicon Mac; riscv64 uses ruvm's Debian riscv64 root (../ruvm/tests/guest/out/linux/root/riscv64).
+# aarch64 defaults to the ruwebos system disk (../ruwebos/out/system.ext4, read-only snapshot) and a
+# scratch data disk out/<arch>/scratch.ext4 (never the real ruwebos data disk; DATA=... to choose), and
+# -accel hvf on an Apple Silicon Mac; riscv64 uses ruvm's Debian riscv64 root (../ruvm/tests/guest/out/linux/root/riscv64).
 # APPEND overrides the kernel command line; INITRD adds an initramfs.
 set -e
 cd "$(dirname "$0")/.."
@@ -27,11 +28,14 @@ done
 tools/build.sh $arch
 if [ $arch = aarch64 ]; then
     console=ttyAMA0
-    disks="-drive file=${SYSTEM:-../ruwebos/out/system.ext4},snapshot=on -drive file=${DATA:-../ruwebos/out/data.ext4}"
+    disks="-drive file=${SYSTEM:-../ruwebos/out/system.ext4},snapshot=on"
 else
     console=ttyS0
     disks="-drive file=${SYSTEM:-$ruvm_dir/tests/guest/out/linux/root/riscv64/root.ext4},snapshot=on"
 fi
+data=${DATA:-out/$arch/scratch.ext4}
+[ -f "$data" ] || dd if=/dev/zero of="$data" bs=1 count=0 seek=256m 2>/dev/null
+disks="$disks -drive file=$data"
 append=${APPEND:-"console=$console root=/dev/vda rootfstype=ext4 rw init=/sbin/init"}
 initrd=
 [ -n "$INITRD" ] && initrd="-initrd $INITRD"

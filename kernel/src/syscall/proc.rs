@@ -844,7 +844,7 @@ pub fn reboot(m1: u32, m2: u32, cmd: u32) -> Result<usize> {
     }
     match cmd {
         0x4321_fedc | 0xcdef_0123 => {
-            crate::fs::sync_all();
+            crate::fs::unmount_all();
             println!("ruxos: power off");
             crate::power::poweroff(&crate::FDT)
         }

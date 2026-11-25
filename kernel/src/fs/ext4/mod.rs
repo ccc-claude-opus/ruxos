@@ -1,8 +1,14 @@
 //! ext4 (the on-disk format of Documentation/filesystems/ext4 in Linux): superblock, block groups,
 //! inodes with extent trees, directories, and (later milestones) allocation and the jbd2 journal.
+mod balloc;
+mod csum;
 mod dir;
 mod extent;
+mod htree;
 mod inode;
+mod journal;
+mod tree;
+mod write;
 
 use super::bufcache::BufCache;
 use crate::block::BlockDevice;
@@ -48,6 +54,8 @@ pub struct Group {
     pub free_inodes: u32,
     pub used_dirs: u32,
     pub flags: u16,
+    /// Inodes at the end of the group's table never used (uninit_bg / metadata_csum).
+    pub itable_unused: u32,
 }
 
 pub struct Super {
@@ -79,6 +87,15 @@ pub struct Ext4 {
     pub ro: bool,
     pub me: Weak<Ext4>,
     pub csum_seed: u32,
+    pub journal: crate::sched::Mutex<Option<journal::Journal>>,
+    /// Serializes metadata changes (allocation, directories, inode tables).
+    pub wlock: crate::sched::Mutex<()>,
+    pub commit_lock: crate::sched::Mutex<()>,
+    pub dirty_inodes: SpinLock<BTreeMap<u32, Arc<Ext4Inode>>>,
+    pub dirty_data: SpinLock<BTreeMap<u32, Arc<Ext4Inode>>>,
+    /// Inodes with no links left, freed at the next commit when unused.
+    pub orphans: SpinLock<Vec<u32>>,
+    pub bitmap_csums: SpinLock<BTreeMap<(usize, bool), u32>>,
 }
 
 impl Ext4 {
@@ -128,10 +145,9 @@ impl Ext4 {
             return Err(EINVAL);
         }
         let ngroups = (sb.blocks_count - sb.first_data_block as u64).div_ceil(sb.blocks_per_group as u64) as usize;
-        let mut ro = ro || dev.readonly();
-        if incompat & INCOMPAT_RECOVER != 0 {
-            println!("ruxos: ext4: the journal needs recovery; mounting read-only");
-            ro = true;
+        let ro = ro || dev.readonly();
+        if incompat & INCOMPAT_RECOVER != 0 && dev.readonly() {
+            println!("ruxos: ext4: the journal needs recovery but the device is read-only");
         }
         let fs = Arc::new_cyclic(|me| Ext4 {
             dev: dev.clone(),
@@ -144,12 +160,43 @@ impl Ext4 {
             ro,
             me: me.clone(),
             csum_seed,
+            journal: crate::sched::Mutex::new(None),
+            wlock: crate::sched::Mutex::new(()),
+            commit_lock: crate::sched::Mutex::new(()),
+            dirty_inodes: SpinLock::new(BTreeMap::new()),
+            dirty_data: SpinLock::new(BTreeMap::new()),
+            orphans: SpinLock::new(Vec::new()),
+            bitmap_csums: SpinLock::new(BTreeMap::new()),
         });
         fs.read_groups(ngroups)?;
+        // the journal: replay what a crash left (also before a read-only mount, like Linux)
+        if let Some(mut j) = journal::Journal::load(&fs)? {
+            let needs = fs.sb.lock().incompat & INCOMPAT_RECOVER != 0;
+            if needs && !dev.readonly() {
+                let n = j.recover(&fs)?;
+                println!("ruxos: ext4: replayed {} journal blocks", n);
+                fs.bufs.forget_all();
+                fs.reread_super()?;
+                fs.read_groups(ngroups)?;
+            }
+            *fs.journal.lock() = Some(j);
+        }
+        if !fs.ro {
+            // mounted: the journal may hold transactions until a clean unmount
+            {
+                let mut sb = fs.sb.lock();
+                sb.incompat |= INCOMPAT_RECOVER;
+                let v = sb.incompat;
+                sb.raw[96..100].copy_from_slice(&v.to_le_bytes());
+            }
+            fs.write_super_buf()?;
+            fs.commit()?;
+            crate::sched::spawn_kernel(flusher, Weak::into_raw(Arc::downgrade(&fs)) as usize);
+        }
         Ok(fs)
     }
 
-    fn gdt_block(&self, g: usize) -> u64 {
+    pub fn gdt_block(&self, g: usize) -> u64 {
         let sb = self.sb.lock();
         let per_block = self.bs / sb.desc_size;
         let first = sb.first_data_block as u64 + 1;
@@ -166,7 +213,7 @@ impl Ext4 {
         first + (g / per_block) as u64
     }
 
-    fn group_has_super(&self, g: usize, sb: &Super) -> bool {
+    pub fn group_has_super(&self, g: usize, sb: &Super) -> bool {
         if sb.ro_compat & 1 == 0 || g <= 1 {
             return true; // without sparse_super every group has a copy
         }
@@ -197,6 +244,7 @@ impl Ext4 {
                 free_inodes: le16(&d, 14) as u32 | (hi16(46) << 16),
                 used_dirs: le16(&d, 16) as u32 | (hi16(48) << 16),
                 flags: le16(&d, 18),
+                itable_unused: le16(&d, 28) as u32 | (hi16(50) << 16),
             });
         }
         *self.groups.lock() = v;
@@ -235,6 +283,42 @@ impl Ext4 {
         Ok(i)
     }
 
+    pub fn reread_super(&self) -> Result<()> {
+        let mut raw = alloc::vec![0u8; 1024];
+        self.dev.read(2, &mut raw)?;
+        let mut sb = self.sb.lock();
+        let is64 = sb.incompat & INCOMPAT_64BIT != 0;
+        sb.free_blocks = le32(&raw, 12) as u64 | if is64 { (le32(&raw, 344) as u64) << 32 } else { 0 };
+        sb.free_inodes = le32(&raw, 16);
+        sb.incompat = le32(&raw, 96);
+        sb.raw = raw;
+        Ok(())
+    }
+
+    /// Unmount or remount read-only: everything to disk, journal clean, needs_recovery off.
+    pub fn shutdown(&self) -> Result<()> {
+        if self.ro {
+            return Ok(());
+        }
+        self.commit()?;
+        {
+            let mut sb = self.sb.lock();
+            sb.incompat &= !INCOMPAT_RECOVER;
+            let v = sb.incompat;
+            sb.raw[96..100].copy_from_slice(&v.to_le_bytes());
+        }
+        self.write_super_buf()?;
+        self.commit()
+    }
+
+    pub fn forget_inode(&self, ino: u32) {
+        self.inodes.lock().remove(&ino);
+    }
+
+    pub fn insert_inode(&self, i: &Arc<Ext4Inode>) {
+        self.inodes.lock().insert(i.ino, Arc::downgrade(i));
+    }
+
     pub fn block_sectors(&self, block: u64) -> u64 {
         block * (self.bs as u64 / 512)
     }
@@ -265,7 +349,27 @@ impl FileSystem for Ext4 {
             flags: 0,
         }
     }
+    fn sync(&self) -> Result<()> {
+        self.commit()
+    }
+    fn unmount(&self) -> Result<()> {
+        self.shutdown()
+    }
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+/// Writes back dirty data and commits every 5 seconds (like Linux's commit= default).
+extern "C" fn flusher(arg: usize) {
+    let weak = unsafe { Weak::from_raw(arg as *const Ext4) };
+    let wq = crate::sched::WaitQueue::new();
+    loop {
+        let d = crate::arch::ticks() + crate::time::ns_to_ticks(5_000_000_000);
+        wq.wait_until(|| false, Some(d), false);
+        let Some(fs) = weak.upgrade() else { return };
+        if let Err(e) = fs.commit() {
+            println!("ruxos: ext4: commit failed: {:?}", e);
+        }
     }
 }
