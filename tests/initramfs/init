@@ -4,6 +4,7 @@
 [ -n "$shell" ] && exec /bin/sh
 export PATH=/bin
 mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts && mount -t devpts -o newinstance,ptmxmode=0666 devpts /dev/pts
 mount -t tmpfs tmpfs /tmp
 mkdir -p /proc /mnt && mount -t proc proc /proc
 fail() { echo "ruxos-test m2: FAIL $*"; poweroff -f; }
@@ -32,6 +33,8 @@ grep -q '^futex: 0 failures' /tmp/futex.out || fail futex
 # glibc, dynamically linked (Debian's libc6 and dash in /sysroot)
 if [ -d /sysroot ]; then
     mount -t proc proc /sysroot/proc
+    mount -t devtmpfs devtmpfs /sysroot/dev
+    mkdir -p /sysroot/dev/pts && mount -t devpts -o newinstance,ptmxmode=0666 devpts /sysroot/dev/pts
     mount -t tmpfs tmpfs /sysroot/tmp
     [ "$(chroot /sysroot /usr/bin/dash -c 'echo $((6*7))')" = 42 ] || fail glibc-dash
     chroot /sysroot /abi > /tmp/abi-glibc.out 2>&1

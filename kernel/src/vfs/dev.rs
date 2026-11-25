@@ -56,6 +56,13 @@ pub fn open_device(inode: &Arc<dyn Inode>, flags: u32) -> Result<Arc<dyn FileOps
         let b = block_device(st.rdev).ok_or(ENXIO)?;
         return Ok(Arc::new(crate::block::BlockFile { dev: b, inode: inode.clone() }));
     }
+    // pseudo-terminals: which devpts instance depends on the node
+    if st.mode & S_IFMT == S_IFCHR && st.rdev == makedev(5, 2) {
+        return crate::pty::open_ptmx(inode, flags);
+    }
+    if st.mode & S_IFMT == S_IFCHR && major(st.rdev) == crate::pty::PTY_SLAVE_MAJOR {
+        return crate::pty::open_slave(inode, minor(st.rdev), flags);
+    }
     let open = CHR.lock().get(&major(st.rdev)).copied().ok_or(ENXIO)?;
     open(minor(st.rdev), flags)
 }

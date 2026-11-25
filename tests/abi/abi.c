@@ -23,6 +23,7 @@
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
+#include <termios.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -504,6 +505,44 @@ static int seccomp_kill_case(void) {
     return 2; // not reached
 }
 
+// pseudo-terminals: a pair from /dev/ptmx, a line through each direction, hangup
+static void test_pty(void) {
+    int m = posix_openpt(O_RDWR | O_NOCTTY);
+    CHECK("pty-open", m >= 0 && grantpt(m) == 0 && unlockpt(m) == 0, "errno %d", errno);
+    if (m < 0) return;
+    unsigned n = 99;
+    CHECK("pty-tiocgptn", ioctl(m, TIOCGPTN, &n) == 0 && n < 99, "n %u errno %d", n, errno);
+    char *name = ptsname(m);
+    int s = name ? open(name, O_RDWR | O_NOCTTY) : -1;
+    CHECK("pty-slave", s >= 0, "%s errno %d", name ? name : "?", errno);
+    if (s < 0) return;
+    char buf[64];
+    // the master types a line: the slave reads it whole (canonical mode), the master sees the echo
+    write(m, "hi\n", 3);
+    int r = read(s, buf, sizeof buf);
+    CHECK("pty-input-line", r == 3 && memcmp(buf, "hi\n", 3) == 0, "%d", r);
+    r = read(m, buf, sizeof buf);
+    CHECK("pty-echo", r == 4 && memcmp(buf, "hi\r\n", 4) == 0, "%d", r);
+    // output: \n becomes \r\n (OPOST ONLCR)
+    write(s, "out\n", 4);
+    r = read(m, buf, sizeof buf);
+    CHECK("pty-output-onlcr", r == 5 && memcmp(buf, "out\r\n", 5) == 0, "%d", r);
+    // raw mode: bytes as they come
+    struct termios t;
+    tcgetattr(s, &t);
+    cfmakeraw(&t);
+    tcsetattr(s, TCSANOW, &t);
+    write(m, "x", 1);
+    r = read(s, buf, sizeof buf);
+    CHECK("pty-raw", r == 1 && buf[0] == 'x', "%d", r);
+    // the master goes away: the slave reads end-of-file and cannot write
+    close(m);
+    r = read(s, buf, sizeof buf);
+    int w = write(s, "y", 1);
+    CHECK("pty-hangup", r == 0 && w == -1 && errno == EIO, "read %d write %d errno %d", r, w, errno);
+    close(s);
+}
+
 static void test_namespaces(void) {
     int st = in_child(userns_case);
     // 100: in a chroot, where the kernel rightly refuses (the rest is checked outside it)
@@ -532,6 +571,7 @@ int main(int argc, char **argv) {
     test_files();
     test_sockets();
     test_namespaces();
+    test_pty();
     pid_t pid = fork();
     if (pid == 0) {
         execl(argv[0], argv[0], "child-exec", (char *)NULL);

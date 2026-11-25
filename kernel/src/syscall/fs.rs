@@ -124,7 +124,8 @@ fn open_how(dirfd: i32, path: &[u8], flags: u32, mode: u32, resolve: u64) -> Res
                     }
                     lk.resolve(&st, path)?
                 } else {
-                    PathRef { mnt: dir.mnt.clone(), d }.clone()
+                    // whatever is mounted on it (a bind-mounted device over a placeholder file)
+                    PathRef { mnt: dir.mnt.clone(), d }.cross_down()
                 }
             }
             None => {
@@ -157,6 +158,10 @@ fn open_how(dirfd: i32, path: &[u8], flags: u32, mode: u32, resolve: u64) -> Res
     let acc = flags & O_ACCMODE;
     if ftype == S_IFDIR && (acc != O_RDONLY || flags & O_TRUNC != 0) {
         return Err(EISDIR);
+    }
+    // device nodes do not open on a nodev mount
+    if (ftype == S_IFCHR || ftype == S_IFBLK) && p.mnt.flags() & path::MNT_NODEV != 0 {
+        return Err(EACCES);
     }
     if !created {
         let want = match acc {
@@ -1290,8 +1295,9 @@ pub fn mount(src: usize, target: usize, fstype: usize, mut flags: u64, data: usi
     let fs = crate::fs::make_fs(&fstype, &src, &data, flags & MS_RDONLY != 0)?;
     let mut mf = mnt_flags(flags);
     let m = Mount::new(path::DEntry::new_root(fs), 0, core::str::from_utf8(&src).unwrap_or(""), core::str::from_utf8(&fstype).unwrap_or(""), core::str::from_utf8(&data).unwrap_or(""));
-    if userns {
-        // device nodes of a file system mounted in a user namespace do not work (SB_I_NODEV)
+    if userns && fstype != b"devpts" {
+        // device nodes of a file system mounted in a user namespace do not work (SB_I_NODEV;
+        // devpts, whose terminals are its point, is the exception)
         mf |= path::MNT_NODEV;
         m.locked.store(path::MNT_NODEV, Relaxed);
     }

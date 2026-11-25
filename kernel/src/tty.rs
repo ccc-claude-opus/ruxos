@@ -1,6 +1,6 @@
-//! The console tty: the UART the kernel prints to, with interrupt-driven input and a line
-//! discipline (canonical mode, echo, erase/kill, signals from ^C ^\ ^Z), termios, window size, and
-//! the controlling terminal of a session.
+//! Terminals: a line discipline (canonical mode, echo, erase/kill, signals from ^C ^\ ^Z), termios,
+//! window size and the controlling terminal of a session, in front of the UART the kernel prints to
+//! (the console) or of a pseudo-terminal master (pty.rs).
 use crate::errno::*;
 use crate::mm::vm::{read_user, write_user};
 use crate::sync::{Once, SpinLock};
@@ -82,26 +82,71 @@ struct Input {
     termios: Termios,
 }
 
+/// Where a terminal's output goes.
+pub enum Sink {
+    Console,
+    /// the master side of a pseudo-terminal
+    Pty(alloc::sync::Weak<crate::pty::Master>),
+}
+
 pub struct Tty {
     input: SpinLock<Input>,
     pub pq: PollQueue,
     pub pgrp: AtomicU32,
     pub sid: AtomicU32,
     winsize: SpinLock<[u16; 4]>,
+    sink: Sink,
+    /// the other side is gone (a pty whose master was closed): reads see end-of-file, writes EIO
+    pub hung: core::sync::atomic::AtomicBool,
 }
 
 pub static CONSOLE: Once<Arc<Tty>> = Once::new();
 
 impl Tty {
-    fn output(&self, data: &[u8]) {
-        let opost = { self.input.lock().termios.oflag };
-        if opost & OPOST != 0 && opost & ONLCR != 0 {
-            crate::console::write_bytes(data);
-        } else {
-            for &c in data {
-                crate::console::putc(c);
+    pub fn new(sink: Sink) -> Arc<Tty> {
+        Arc::new(Tty {
+            input: SpinLock::new(Input { ready: VecDeque::new(), line: Vec::new(), eof: 0, termios: Termios::default() }),
+            pq: PollQueue::new(),
+            pgrp: AtomicU32::new(0),
+            sid: AtomicU32::new(0),
+            winsize: SpinLock::new([24, 80, 0, 0]),
+            sink,
+            hung: core::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Bytes to the device, after output processing (OPOST: ONLCR) per `oflag` (passed in: the
+    /// caller may hold the input lock).
+    fn put(&self, data: &[u8], process: bool, o: u32) {
+        let onlcr = process && o & OPOST != 0 && o & ONLCR != 0;
+        match &self.sink {
+            Sink::Console => {
+                if onlcr {
+                    crate::console::write_bytes(data);
+                } else {
+                    for &c in data {
+                        crate::console::putc(c);
+                    }
+                }
+            }
+            Sink::Pty(m) => {
+                if let Some(m) = m.upgrade() {
+                    let mut v = Vec::with_capacity(data.len());
+                    for &c in data {
+                        if onlcr && c == b'\n' {
+                            v.push(b'\r');
+                        }
+                        v.push(c);
+                    }
+                    m.from_slave(&v);
+                }
             }
         }
+    }
+
+    fn output(&self, data: &[u8]) {
+        let o = self.input.lock().termios.oflag;
+        self.put(data, true, o);
     }
 
     fn echo(&self, t: &Termios, c: u8) {
@@ -109,18 +154,15 @@ impl Tty {
             return;
         }
         if c < 0x20 && c != b'\n' && c != b'\t' && t.lflag & ECHOCTL != 0 {
-            crate::console::putc(b'^');
-            crate::console::putc(c + 0x40);
-        } else if c == b'\n' {
-            crate::console::write_bytes(b"\n");
+            self.put(&[b'^', c + 0x40], false, t.oflag);
         } else {
-            crate::console::putc(c);
+            self.put(&[c], true, t.oflag);
         }
     }
 
-    /// One byte from the UART.
+    /// One byte of input (from the UART, or written to a pty master).
     pub fn receive(&self, mut c: u8) {
-        if c == 0x14 && crate::kernel_param("ruxos.debug").is_some() {
+        if c == 0x14 && matches!(self.sink, Sink::Console) && crate::kernel_param("ruxos.debug").is_some() {
             if crate::kernel_param("ruxos.debug") != Some("short") {
                 crate::sched::dump_tasks();
             }
@@ -191,7 +233,38 @@ impl Tty {
 
     fn can_read(&self) -> bool {
         let i = self.input.lock();
-        !i.ready.is_empty() || i.eof > 0
+        !i.ready.is_empty() || i.eof > 0 || self.hung.load(Ordering::Relaxed)
+    }
+
+    /// The master of a pty went away: the slave sees end-of-file, its session SIGHUP.
+    pub fn hangup(&self) {
+        self.hung.store(true, Ordering::SeqCst);
+        let pg = self.pgrp.load(Ordering::Relaxed);
+        if pg != 0 && self.sid.load(Ordering::Relaxed) != 0 {
+            let _ = crate::syscall::proc::kill_pgrp(pg, SigInfo::kernel(signal::SIGHUP));
+            let _ = crate::syscall::proc::kill_pgrp(pg, SigInfo::kernel(signal::SIGCONT));
+        }
+        self.pq.notify(POLLIN | POLLOUT | POLLHUP);
+    }
+
+    /// Bytes ready to be read (FIONREAD on the master side counts the other direction).
+    pub fn input_len(&self) -> usize {
+        self.input.lock().ready.len()
+    }
+
+    /// A session leader without a terminal that opens this one without O_NOCTTY acquires it.
+    pub fn maybe_acquire(self: &Arc<Self>, flags: u32) {
+        if flags & O_NOCTTY != 0 {
+            return;
+        }
+        if let Some(th) = crate::task::try_current_thread() {
+            let p = &th.proc;
+            if p.sid.load(Ordering::Relaxed) == p.pid && p.ctty.lock().is_none() && self.sid.load(Ordering::Relaxed) == 0 {
+                self.sid.store(p.pid, Ordering::Relaxed);
+                self.pgrp.store(p.pgid.load(Ordering::Relaxed), Ordering::Relaxed);
+                *p.ctty.lock() = Some(self.clone());
+            }
+        }
     }
 
     /// The session leader of the tty's session exited: the session loses its terminal.
@@ -234,6 +307,9 @@ impl FileOps for TtyFile {
                     i.eof -= 1;
                     return Ok(0);
                 }
+                if tty.hung.load(Ordering::Relaxed) {
+                    return Ok(0);
+                }
                 if i.termios.lflag & ICANON == 0 && i.termios.cc[VMIN] == 0 && i.termios.cc[VTIME] == 0 {
                     return Ok(0);
                 }
@@ -248,12 +324,16 @@ impl FileOps for TtyFile {
     }
 
     fn write(&self, _f: &File, buf: &[u8]) -> Result<usize> {
+        if self.tty.hung.load(Ordering::Relaxed) {
+            return Err(EIO);
+        }
         self.tty.output(buf);
         Ok(buf.len())
     }
 
     fn poll(&self, _f: &File) -> u32 {
-        POLLOUT | POLLWRNORM | if self.tty.can_read() { POLLIN | POLLRDNORM } else { 0 }
+        let hup = if self.tty.hung.load(Ordering::Relaxed) { POLLHUP } else { 0 };
+        hup | POLLOUT | POLLWRNORM | if self.tty.can_read() { POLLIN | POLLRDNORM } else { 0 }
     }
 
     fn poll_queue(&self) -> Option<&PollQueue> {
@@ -341,15 +421,8 @@ fn open_tty(minor: u32, flags: u32, console: bool) -> Result<Arc<dyn FileOps>> {
     let _ = minor;
     let tty = CONSOLE.get().ok_or(ENXIO)?.clone();
     // a session leader without a terminal acquires this one (never through /dev/console)
-    if !console && flags & O_NOCTTY == 0 {
-        if let Some(th) = crate::task::try_current_thread() {
-            let p = &th.proc;
-            if p.sid.load(Ordering::Relaxed) == p.pid && p.ctty.lock().is_none() && tty.sid.load(Ordering::Relaxed) == 0 {
-                tty.sid.store(p.pid, Ordering::Relaxed);
-                tty.pgrp.store(p.pgid.load(Ordering::Relaxed), Ordering::Relaxed);
-                *p.ctty.lock() = Some(tty.clone());
-            }
-        }
+    if !console {
+        tty.maybe_acquire(flags);
     }
     Ok(Arc::new(TtyFile { tty }))
 }
@@ -393,20 +466,15 @@ fn uart_irq(_irq: u32) {
 }
 
 pub fn init(fdt: &crate::fdt::Fdt) {
-    let tty = Arc::new(Tty {
-        input: SpinLock::new(Input { ready: VecDeque::new(), line: Vec::new(), eof: 0, termios: Termios::default() }),
-        pq: PollQueue::new(),
-        pgrp: AtomicU32::new(0),
-        sid: AtomicU32::new(0),
-        winsize: SpinLock::new([24, 80, 0, 0]),
-    });
-    CONSOLE.set(tty);
+    CONSOLE.set(Tty::new(Sink::Console));
     use crate::vfs::{dev, makedev, S_IFCHR};
     dev::register_chr(5, open_major5);
     dev::register_chr(204, open_serial);
     dev::register_chr(4, open_serial);
     dev::add_node(b"console", S_IFCHR | 0o600, makedev(5, 1));
     dev::add_node(b"tty", S_IFCHR | 0o666, makedev(5, 0));
+    // /dev/ptmx: new pseudo-terminals from the devpts instance on /dev/pts (pty.rs)
+    dev::add_node(b"ptmx", S_IFCHR | 0o666, makedev(5, 2));
     let (base, pl011) = crate::console::uart();
     UART_PL011.store(pl011, Ordering::Relaxed);
     if pl011 {

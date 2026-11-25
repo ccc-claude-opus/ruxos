@@ -58,18 +58,25 @@ fn tmpfs(data: &[u8]) -> Result<Arc<dyn FileSystem>> {
     Ok(crate::vfs::tmpfs::TmpFs::with_options("tmpfs", mode, uid, gid, max))
 }
 
-/// devpts (newinstance): the ptmx node (ptmxmode=, default 0000) and the terminals' slaves.
+/// devpts (newinstance): the ptmx node (ptmxmode=, default 0000) and the terminals' slaves
+/// (mode=, default 0600; gid=, default the opener's), see pty.rs.
 fn devpts(data: &[u8]) -> Result<Arc<dyn FileSystem>> {
-    let mut ptmxmode = 0u32;
+    let c = crate::task::current_proc().cred();
+    let (mut ptmxmode, mut mode, mut gid) = (0u32, 0o600u32, u32::MAX);
     for (k, v) in options(data) {
         match k {
             b"ptmxmode" => ptmxmode = num(v, 8)? as u32 & 0o777,
-            b"newinstance" | b"mode" | b"gid" | b"uid" | b"max" => {}
+            b"mode" => mode = num(v, 8)? as u32 & 0o777,
+            b"gid" => gid = c.user_ns.make_kgid(num(v, 10)? as u32).ok_or(EINVAL)?,
+            b"newinstance" | b"uid" | b"max" => {}
             _ => return Err(EINVAL),
         }
     }
-    let fs = crate::vfs::tmpfs::TmpFs::with_options("devpts", 0o755, 0, 0, u64::MAX);
-    fs.root().create(b"ptmx", crate::vfs::S_IFCHR | ptmxmode, crate::vfs::makedev(5, 2), 0, 0)?;
+    // the root and ptmx belong to root of the mounter's user namespace
+    let (ru, rg) = (c.user_ns.make_kuid(0).unwrap_or(0), c.user_ns.make_kgid(0).unwrap_or(0));
+    let fs: Arc<dyn FileSystem> = crate::vfs::tmpfs::TmpFs::with_options("devpts", 0o755, ru, rg, u64::MAX);
+    fs.root().create(b"ptmx", crate::vfs::S_IFCHR | ptmxmode, crate::vfs::makedev(5, 2), ru, rg)?;
+    crate::pty::register(&fs, mode, gid);
     Ok(fs)
 }
 

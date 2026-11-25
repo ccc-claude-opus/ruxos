@@ -22,6 +22,7 @@ mod net;
 mod ns;
 mod percpu;
 mod power;
+mod pty;
 mod random;
 mod sched;
 mod seccomp;
