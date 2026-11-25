@@ -313,6 +313,10 @@ pub fn switch_user_state(prev: &Task, next: &Task) {
             crate::percpu::this().loaded_mm.store(n.mm.id, Ordering::Relaxed);
         }
         n.mm.cpus.fetch_or(1 << cpu, Ordering::Relaxed);
+    } else if arch::KERNEL_IN_USER_ROOT && crate::percpu::this().loaded_mm.load(Ordering::Relaxed) != 0 {
+        // a task without an address space: off the user table, which may be freed meanwhile
+        arch::activate_kernel_only();
+        crate::percpu::this().loaded_mm.store(0, Ordering::Relaxed);
     }
 }
 
@@ -699,6 +703,10 @@ pub fn exit(code: i32, group: bool) -> ! {
 
 /// The last thread of `proc` is gone: zombie it, reparent its children, tell the parent.
 fn process_exit(proc: &Arc<Process>, status: i32) {
+    // the first process may not end (as Linux: the kernel panics; panic=N reboots after it)
+    if INIT.get().is_some_and(|i| Arc::ptr_eq(i, proc)) {
+        panic!("Attempted to kill init! exitcode={:#010x}", status);
+    }
     crate::locks::release_process(proc.pid);
     // pid 1 of a PID namespace takes the namespace down with it (pid_namespaces(7))
     let ns = proc.pid_ns.clone();

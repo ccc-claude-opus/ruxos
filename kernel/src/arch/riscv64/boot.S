@@ -26,6 +26,8 @@ _start:
 primary_entry:
     csrw    sie, zero
     csrw    sip, zero
+    mv      tp, zero                // the per-CPU pointer (firmware such as OpenSBI may leave its own)
+    csrw    sscratch, zero          // 0 while in the kernel (entry.S); the firmware may leave a value
     mv      s0, a0                  // hart id
     mv      s1, a1                  // device tree
     lla     t0, _bss_start
@@ -53,6 +55,8 @@ primary_high:
 .global secondary_entry
 secondary_entry:
     csrw    sie, zero
+    mv      tp, zero
+    csrw    sscratch, zero
     mv      s0, a0
     mv      s1, a1
     call    enable_mmu

@@ -324,6 +324,11 @@ pub fn tlb_flush_asid(asid: usize) {
 /// A spurious fault on this CPU (the entry is valid now): nothing cached to drop on AArch64.
 pub fn tlb_local_page(_asid: usize, _va: usize) {}
 
+/// The kernel is in TTBR1: a hart may keep a user table loaded while it runs kernel threads.
+pub const KERNEL_IN_USER_ROOT: bool = false;
+
+pub fn activate_kernel_only() {}
+
 pub fn activate_mm(root: usize, asid: usize) {
     unsafe { asm!("msr ttbr0_el1, {}", "isb", in(reg) (asid << 48) | root, options(nostack)) };
 }

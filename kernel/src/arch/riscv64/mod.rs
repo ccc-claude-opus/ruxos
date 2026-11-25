@@ -394,6 +394,17 @@ fn sbi_call6(eid: usize, fid: usize, a0: usize, a1: usize, a2: usize, a3: usize,
     }
 }
 
+/// The kernel's mappings live in every user root table here (entries 256..511), so a hart must not
+/// keep running on the root of an address space that may be freed: tasks without one (idle, kernel
+/// threads) and the teardown of an address space switch to the boot table (ASID 0).
+pub const KERNEL_IN_USER_ROOT: bool = true;
+
+pub fn activate_kernel_only() {
+    let root = crate::arch::virt_to_phys(&raw const boot_root as usize);
+    let satp = (8usize << 60) | (root >> 12);
+    unsafe { asm!("csrw satp, {}", in(reg) satp, options(nostack)) };
+}
+
 pub fn activate_mm(root: usize, asid: usize) {
     let satp = (8usize << 60) | (asid << 44) | (root >> 12);
     unsafe { asm!("csrw satp, {}", in(reg) satp, options(nostack)) };

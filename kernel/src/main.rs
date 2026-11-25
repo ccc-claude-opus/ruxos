@@ -262,5 +262,19 @@ fn init_args(init: &str) -> (alloc::vec::Vec<alloc::vec::Vec<u8>>, alloc::vec::V
 fn panic(info: &PanicInfo) -> ! {
     arch::irq_disable();
     println!("ruxos: panic on cpu {}: {info}", percpu::this().id);
+    // panic=N (as Linux): reboot after N seconds, at once when negative; 0 (default): stay halted
+    let secs: i64 = kernel_param("panic").and_then(|v| v.parse().ok()).unwrap_or(0);
+    if secs != 0 {
+        if let Some(fdt) = FDT.get() {
+            if secs > 0 {
+                println!("ruxos: rebooting in {} seconds", secs);
+                let until = arch::ticks() + time::ns_to_ticks(secs as u64 * 1_000_000_000);
+                while arch::ticks() < until {
+                    core::hint::spin_loop();
+                }
+            }
+            power::reboot(fdt);
+        }
+    }
     power::halt();
 }

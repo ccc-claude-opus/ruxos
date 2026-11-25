@@ -462,6 +462,12 @@ pub fn find_vma(vmas: &BTreeMap<usize, Vma>, va: usize) -> Option<&Vma> {
 
 impl Drop for Mm {
     fn drop(&mut self) {
+        // never free the table this hart runs on (its kernel half is in use on riscv64)
+        let pc = crate::percpu::this();
+        if pc.loaded_mm.load(Ordering::Relaxed) == self.id {
+            arch::activate_kernel_only();
+            pc.loaded_mm.store(0, Ordering::Relaxed);
+        }
         let n = self.rss_pages();
         self.uncharge_pages(n);
         // free every page and table
