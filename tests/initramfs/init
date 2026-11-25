@@ -47,6 +47,11 @@ if [ -b /dev/vda ]; then
         chroot /mnt /usr/local/bin/node /tmp/basic.js > /tmp/node.out 2>&1
         grep -v '^ok' /tmp/node.out
         grep -q '^node-test: ok' /tmp/node.out || fail node
+        cp /tests/net.js /mnt/tmp/
+        ifconfig lo 127.0.0.1 up
+        chroot /mnt /usr/local/bin/node /tmp/net.js > /tmp/net.out 2>&1
+        grep -v '^ok' /tmp/net.out
+        grep -q '^net-test: ok' /tmp/net.out || fail net
     else
         [ -x /mnt/bin/busybox ] && [ "$(chroot /mnt /bin/busybox echo hi)" = hi ] || fail ext4-exec
     fi

@@ -152,6 +152,7 @@ extern "C" fn kernel_init(_: usize) {
     vfs::dev::init();
     tty::init(&fdt);
     drivers::virtio::init(&fdt);
+    net::inet::init();
     vdso::init();
 
     // the root file system: the initramfs in a tmpfs, else root=

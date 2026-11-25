@@ -73,6 +73,10 @@ impl<T: ?Sized> SpinLock<T> {
         }
     }
 
+    pub fn get_mut_inner(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
+
     pub fn is_locked(&self) -> bool {
         self.locked.load(Ordering::Relaxed)
     }

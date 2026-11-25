@@ -629,6 +629,9 @@ impl Socket for UnixSocket {
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<isize> {
+        if (0x8900..0x8a00).contains(&cmd) {
+            return super::ifreq::ioctl(cmd, arg);
+        }
         match cmd {
             0x541b => {
                 // FIONREAD

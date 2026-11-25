@@ -251,16 +251,6 @@ impl VirtQueue {
             let (id, len) = self.used_elem(q.last_used);
             q.last_used = q.last_used.wrapping_add(1);
             let id = id as u16;
-            // free the chain
-            let mut d = id;
-            loop {
-                let desc = unsafe { read_volatile(self.desc_at(d)) };
-                q.free.push(d);
-                if desc.flags & DESC_NEXT == 0 {
-                    break;
-                }
-                d = desc.next;
-            }
             let e = &mut q.done[id as usize];
             e.0 = true;
             e.1 = len;
@@ -277,6 +267,35 @@ impl VirtQueue {
         n
     }
 
+    /// Frees the descriptors of a finished request (only once its buffers are no longer needed:
+    /// a receive buffer stays posted until it is taken).
+    fn release(&self, q: &mut QInner, head: u16) {
+        let mut d = head;
+        loop {
+            let desc = unsafe { read_volatile(self.desc_at(d)) };
+            q.free.push(d);
+            if desc.flags & DESC_NEXT == 0 {
+                break;
+            }
+            d = desc.next;
+        }
+        q.done[head as usize] = (false, 0, 0);
+    }
+
+    /// Forgets a finished request nobody waits for (transmit buffers).
+    pub fn reap(&self, head: u16) {
+        let mut q = self.inner.lock();
+        self.release(&mut q, head);
+        drop(q);
+        self.wq.wake_all();
+    }
+
+    /// (device's used index, our last seen used index, free descriptors) for debugging.
+    pub fn debug_state(&self) -> (u16, u16, usize, u16) {
+        let q = self.inner.lock();
+        (unsafe { read_volatile(self.used_idx()) }, q.last_used, q.free.len(), unsafe { read_volatile(self.avail_idx()) })
+    }
+
     pub fn is_done(&self, head: u16) -> bool {
         self.inner.lock().done[head as usize].0
     }
@@ -290,7 +309,9 @@ impl VirtQueue {
         });
         let mut q = self.inner.lock();
         let len = q.done[head as usize].1;
-        q.done[head as usize] = (false, 0, 0);
+        self.release(&mut q, head);
+        drop(q);
+        self.wq.wake_all();
         len
     }
 
@@ -303,7 +324,7 @@ impl VirtQueue {
         }
         head_order.pop_front();
         let len = q.done[h as usize].1;
-        q.done[h as usize] = (false, 0, 0);
+        self.release(&mut q, h);
         Some((h, len))
     }
 }
@@ -347,6 +368,9 @@ pub fn init(fdt: &Fdt) {
             }
             4 => {
                 let _ = super::virtio_rng::init(f.mmio.clone());
+            }
+            1 => {
+                let _ = super::virtio_net::init(f.mmio.clone());
             }
             _ => {}
         }

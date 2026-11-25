@@ -19,13 +19,13 @@ run() { # run <arch> <accel> <test>
         m2)
             # a fresh scratch disk for the ext4 write tests, checked with e2fsck afterwards
             "$mkfs" -q -F -b 4096 out/$arch/scratch.ext4 256m
-            out=$(INITRD=out/$arch/test-initramfs.cpio.gz APPEND="console=$console rdinit=/init ext4rw=1 keep=1" timeout 900 tools/run.sh $arch --accel $accel --smp 4 2>&1 || true)
+            out=$(INITRD=out/$arch/test-initramfs.cpio.gz APPEND="console=$console rdinit=/init ext4rw=1 keep=1" timeout 900 tools/run.sh $arch --accel $accel --smp 4 </dev/null 2>&1 || true)
             if ! fsck=$("$e2fsck" -fn out/$arch/scratch.ext4 2>&1); then
                 out="$out
 e2fsck: $fsck"
                 out=$(echo "$out" | sed 's/ruxos-test m2: ok/ruxos-test m2: e2fsck found errors/')
             fi ;;
-        *) out=$(APPEND="console=$console ruxos.test=$t" timeout 120 tools/run.sh $arch --accel $accel --smp 4 2>&1 || true) ;;
+        *) out=$(APPEND="console=$console ruxos.test=$t" timeout 120 tools/run.sh $arch --accel $accel --smp 4 </dev/null 2>&1 || true) ;;
     esac
     line=$(echo "$out" | grep -a "ruxos-test $t:" | tail -1)
     case $line in

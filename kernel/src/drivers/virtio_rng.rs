@@ -18,6 +18,7 @@ pub fn init(mmio: Arc<Mmio>) -> Result<()> {
     }
     if q.is_done(head) {
         crate::random::mix(&b);
+        q.reap(head);
     }
     Ok(())
 }

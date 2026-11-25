@@ -1,5 +1,8 @@
 //! Sockets: the socket file, addresses, and the address families (AF_UNIX here; AF_INET and
 //! AF_NETLINK in the network milestone).
+pub mod ifreq;
+pub mod inet;
+pub mod netlink;
 pub mod unix;
 
 use crate::errno::*;
@@ -148,11 +151,13 @@ pub fn create(family: u16, ty: u32, proto: i32) -> Result<Arc<dyn Socket>> {
     }
 }
 
-/// Filled in by the network milestone.
-pub fn inet_socket(_family: u16, _ty: u32, _proto: i32) -> Result<Arc<dyn Socket>> {
-    Err(EAFNOSUPPORT)
+pub fn inet_socket(family: u16, ty: u32, proto: i32) -> Result<Arc<dyn Socket>> {
+    if family == AF_INET6 {
+        return Err(EAFNOSUPPORT); // IPv4 only (ruvm's user-mode network has no IPv6)
+    }
+    inet::socket(family, ty, proto)
 }
 
-pub fn netlink_socket(_ty: u32, _proto: i32) -> Result<Arc<dyn Socket>> {
-    Err(EAFNOSUPPORT)
+pub fn netlink_socket(ty: u32, proto: i32) -> Result<Arc<dyn Socket>> {
+    netlink::socket(ty, proto)
 }

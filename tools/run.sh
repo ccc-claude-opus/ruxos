@@ -43,7 +43,18 @@ if [ -n "$qemu" ]; then
     m=virt cpu="-cpu max"
     [ -n "$accel" ] && cpu="-cpu host -accel $accel"
     # shellcheck disable=SC2086
-    exec qemu-system-$arch -M $m $cpu -smp $smp -m $mem -nographic -kernel out/$arch/ruxos $initrd -append "$append" "$@"
+    # virtio-mmio devices in the same roles as with ruvm (QEMU lists them in reverse order)
+    qdisks=""
+    for d in $(echo "$disks" | sed 's/-drive file=//g'); do
+        f=${d%%,*}
+        snap=""
+        case $d in *snapshot=on*) snap=",snapshot=on" ;; esac
+        n=d$(echo "$f" | cksum | cut -d' ' -f1)
+        qdisks="-drive if=none,id=$n,file=$f,format=raw$snap -device virtio-blk-device,drive=$n $qdisks"
+    done
+    exec qemu-system-$arch -M $m $cpu -smp $smp -m $mem -nographic -kernel out/$arch/ruxos $initrd -append "$append" \
+        -global virtio-mmio.force-legacy=false -netdev user,id=net,hostfwd=tcp::${PORT:-8701}-:8700 -device virtio-net-device,netdev=net \
+        -object rng-random,id=rng,filename=/dev/urandom -device virtio-rng-device,rng=rng $qdisks "$@"
 fi
 # shellcheck disable=SC2086
 exec "$ruvm_dir/target/release/ruvm" -M $arch -m $mem -smp $smp ${accel:+-accel $accel} -kernel out/$arch/ruxos $initrd \
