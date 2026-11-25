@@ -16,7 +16,7 @@ pub fn unpack(data: &[u8], root: &PathRef) -> Result<usize> {
         data
     };
     let cred = Cred::root();
-    let lk = path::Lookup { root, cred: &cred, follow_last: false, beneath: false, no_symlinks: false };
+    let lk = path::Lookup { root, cred: &cred, follow_last: false, beneath: false, no_symlinks: false, no_magiclinks: false, no_xdev: false };
     let mut off = 0;
     let mut count = 0;
     while off + 110 <= data.len() {

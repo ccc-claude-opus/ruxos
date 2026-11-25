@@ -223,11 +223,12 @@ pub fn dump() {
     }
 }
 
-pub fn local_ip(a: [u8; 4]) -> bool {
+/// An address of this host in namespace `ns`: 127/8, and in the initial namespace eth0's address.
+pub fn local_ip_in(ns: &crate::ns::NetNs, a: [u8; 4]) -> bool {
     if a[0] == 127 {
         return true;
     }
-    STACK.lock().as_ref().and_then(|s| s.addr).is_some_and(|(ip, _)| ip.octets() == a)
+    ns.is_init && STACK.lock().as_ref().and_then(|s| s.addr).is_some_and(|(ip, _)| ip.octets() == a)
 }
 
 // ---- addresses
@@ -261,22 +262,25 @@ impl Sin {
     }
 }
 
-fn ephemeral() -> u16 {
+/// A free port in network namespace `ns`.
+fn ephemeral(ns: u64) -> u16 {
     loop {
         let p = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
         if p >= 60999 {
             NEXT_PORT.store(32768, Ordering::Relaxed);
         }
-        if !LISTENERS.lock().contains_key(&p) && !UDP_PORTS.lock().contains_key(&p) {
+        if !LISTENERS.lock().contains_key(&(ns, p)) && !UDP_PORTS.lock().contains_key(&(ns, p)) {
             return p;
         }
     }
 }
 
+/// Ports are per network namespace: (namespace inode, port).
+type PortKey = (u64, u16);
 /// Listening TCP sockets by port (for local connections).
-static LISTENERS: SpinLock<BTreeMap<u16, Vec<Weak<InetSocket>>>> = SpinLock::new(BTreeMap::new());
+static LISTENERS: SpinLock<BTreeMap<PortKey, Vec<Weak<InetSocket>>>> = SpinLock::new(BTreeMap::new());
 /// Bound UDP sockets by port.
-static UDP_PORTS: SpinLock<BTreeMap<u16, Weak<InetSocket>>> = SpinLock::new(BTreeMap::new());
+static UDP_PORTS: SpinLock<BTreeMap<PortKey, Weak<InetSocket>>> = SpinLock::new(BTreeMap::new());
 
 // ---- sockets
 
@@ -304,6 +308,8 @@ pub struct InetSocket {
     shut_wr: AtomicBool,
     /// local UDP datagrams received (from, data)
     udp_rx: SpinLock<VecDeque<(Sin, Vec<u8>)>>,
+    /// the network namespace it belongs to (only the initial one reaches eth0)
+    ns: Arc<crate::ns::NetNs>,
 }
 
 pub fn socket(_family: u16, ty: u32, proto: i32) -> Result<Arc<dyn Socket>> {
@@ -331,7 +337,28 @@ impl InetSocket {
             keepalive: AtomicBool::new(false),
             shut_wr: AtomicBool::new(false),
             udp_rx: SpinLock::new(VecDeque::new()),
+            ns: crate::ns::cur_net(),
         })
+    }
+
+    fn key(&self, port: u16) -> PortKey {
+        (self.ns.ino, port)
+    }
+
+    fn is_local(&self, a: [u8; 4]) -> bool {
+        local_ip_in(&self.ns, a)
+    }
+
+    /// A new namespace reaches 127/8 once its lo is up, and nothing else.
+    fn reachable(&self, a: [u8; 4]) -> Result<()> {
+        if self.ns.is_init {
+            return Ok(());
+        }
+        if a[0] == 127 && self.ns.loopback_ok() {
+            Ok(())
+        } else {
+            Err(ENETUNREACH)
+        }
     }
 
     fn own(&self, s: &mut Stack, h: SocketHandle) {
@@ -426,10 +453,11 @@ impl Drop for InetSocket {
     fn drop(&mut self) {
         let st = core::mem::replace(self.st.get_mut_inner(), State::Closed);
         if let Some(l) = *self.local.lock() {
-            LISTENERS.lock().get_mut(&l.port).map(|v| v.retain(|w| w.strong_count() > 0));
+            let k = (self.ns.ino, l.port);
+            LISTENERS.lock().get_mut(&k).map(|v| v.retain(|w| w.strong_count() > 0));
             let mut u = UDP_PORTS.lock();
-            if u.get(&l.port).is_some_and(|w| w.strong_count() == 0) {
-                u.remove(&l.port);
+            if u.get(&k).is_some_and(|w| w.strong_count() == 0) {
+                u.remove(&k);
             }
         }
         let mut g = STACK.lock();
@@ -482,21 +510,21 @@ impl Socket for InetSocket {
         if self.local.lock().is_some() {
             return Err(EINVAL);
         }
-        if !a.any() && !local_ip(a.ip) {
+        if !a.any() && !self.is_local(a.ip) {
             return Err(EADDRNOTAVAIL);
         }
         if a.port == 0 {
-            a.port = ephemeral();
-        } else if a.port < 1024 && !crate::task::current_proc().cred().capable(10) {
+            a.port = ephemeral(self.ns.ino);
+        } else if a.port < 1024 && !crate::task::current_proc().cred().ns_capable(&self.ns.user_ns, 10) {
             return Err(EACCES);
         }
         if self.ty == SOCK_DGRAM {
             let mut u = UDP_PORTS.lock();
-            if u.get(&a.port).is_some_and(|w| w.strong_count() > 0) {
+            if u.get(&self.key(a.port)).is_some_and(|w| w.strong_count() > 0) {
                 return Err(EADDRINUSE);
             }
-            u.insert(a.port, self.me.clone());
-        } else if LISTENERS.lock().get(&a.port).is_some_and(|v| v.iter().any(|w| w.upgrade().is_some_and(|l| l.local.lock().is_some_and(|x| x.any() || a.any() || x.ip == a.ip)))) {
+            u.insert(self.key(a.port), self.me.clone());
+        } else if LISTENERS.lock().get(&self.key(a.port)).is_some_and(|v| v.iter().any(|w| w.upgrade().is_some_and(|l| l.local.lock().is_some_and(|x| x.any() || a.any() || x.ip == a.ip)))) {
             return Err(EADDRINUSE);
         }
         *self.local.lock() = Some(a);
@@ -508,7 +536,7 @@ impl Socket for InetSocket {
             return Err(EOPNOTSUPP);
         }
         if self.local.lock().is_none() {
-            *self.local.lock() = Some(Sin { ip: [0; 4], port: ephemeral() });
+            *self.local.lock() = Some(Sin { ip: [0; 4], port: ephemeral(self.ns.ino) });
         }
         let l = self.local.lock().unwrap();
         match self.view() {
@@ -521,9 +549,10 @@ impl Socket for InetSocket {
             View::Fresh => {}
             _ => return Err(EINVAL),
         }
-        // from other hosts: smoltcp listeners on eth0 (unless bound to loopback only)
+        // from other hosts: smoltcp listeners on eth0 (unless bound to loopback only, or in a
+        // namespace without eth0)
         let mut pool = Vec::new();
-        if l.ip[0] != 127 {
+        if l.ip[0] != 127 && self.ns.is_init {
             let mut g = STACK.lock();
             if let Some(s) = g.as_mut() {
                 for _ in 0..LISTEN_POOL {
@@ -539,7 +568,7 @@ impl Socket for InetSocket {
         } else {
             *self.st.lock() = State::Listening { backlog: VecDeque::new(), max: backlog.clamp(1, 4096) as usize, pool };
         }
-        LISTENERS.lock().entry(l.port).or_default().push(self.me.clone());
+        LISTENERS.lock().entry(self.key(l.port)).or_default().push(self.me.clone());
         kick();
         Ok(())
     }
@@ -563,11 +592,12 @@ impl Socket for InetSocket {
         let to = Sin::parse(addr)?;
         if self.ty == SOCK_DGRAM {
             *self.peer.lock() = Some(to);
+            self.reachable(to.ip)?;
             if self.local.lock().is_none() {
-                let ip = if local_ip(to.ip) { [127, 0, 0, 1] } else { STACK.lock().as_ref().and_then(|s| s.addr).map_or([0; 4], |a| a.0.octets()) };
-                let p = ephemeral();
+                let ip = if self.is_local(to.ip) { [127, 0, 0, 1] } else { STACK.lock().as_ref().and_then(|s| s.addr).map_or([0; 4], |a| a.0.octets()) };
+                let p = ephemeral(self.ns.ino);
                 *self.local.lock() = Some(Sin { ip, port: p });
-                UDP_PORTS.lock().insert(p, self.me.clone());
+                UDP_PORTS.lock().insert(self.key(p), self.me.clone());
             }
             return Ok(());
         }
@@ -576,14 +606,15 @@ impl Socket for InetSocket {
             State::Tcp { .. } | State::Local { .. } => return Err(EISCONN),
             _ => return Err(EINVAL),
         }
-        if local_ip(to.ip) || to.ip == [0; 4] {
-            // a listener on this host
-            let l = LISTENERS.lock().get(&to.port).and_then(|v| {
+        self.reachable(if to.ip == [0; 4] { [127, 0, 0, 1] } else { to.ip })?;
+        if self.is_local(to.ip) || to.ip == [0; 4] {
+            // a listener on this host (in this namespace)
+            let l = LISTENERS.lock().get(&self.key(to.port)).and_then(|v| {
                 v.iter().filter_map(|w| w.upgrade()).find(|l| l.local.lock().is_some_and(|a| a.any() || a.ip == to.ip || (a.ip[0] == 127 && to.ip[0] == 127)))
             });
             let Some(l) = l else { return Err(ECONNREFUSED) };
             let (a, b) = UnixSocket::pair(SOCK_STREAM)?;
-            let me_addr = Sin { ip: if to.ip[0] == 127 || to.ip == [0; 4] { [127, 0, 0, 1] } else { to.ip }, port: ephemeral() };
+            let me_addr = Sin { ip: if to.ip[0] == 127 || to.ip == [0; 4] { [127, 0, 0, 1] } else { to.ip }, port: ephemeral(self.ns.ino) };
             let server = InetSocket::new(SOCK_STREAM, State::Local { end: b });
             *server.local.lock() = Some(Sin { ip: me_addr.ip, port: to.port });
             *server.peer.lock() = Some(me_addr);
@@ -604,7 +635,7 @@ impl Socket for InetSocket {
             return Ok(());
         }
         // another host: TCP over eth0
-        let lport = ephemeral();
+        let lport = ephemeral(self.ns.ino);
         let h = {
             let mut g = STACK.lock();
             let s = g.as_mut().ok_or(ENETUNREACH)?;
@@ -941,9 +972,9 @@ impl InetSocket {
         let port = {
             let mut l = self.local.lock();
             if l.is_none() {
-                let p = ephemeral();
+                let p = ephemeral(self.ns.ino);
                 *l = Some(Sin { ip: [0; 4], port: p });
-                UDP_PORTS.lock().insert(p, self.me.clone());
+                UDP_PORTS.lock().insert(self.key(p), self.me.clone());
             }
             l.unwrap().port
         };
@@ -958,14 +989,15 @@ impl InetSocket {
             Some(a) => Sin::parse(a)?,
             None => self.peer.lock().ok_or(EDESTADDRREQ)?,
         };
-        if local_ip(to.ip) {
+        self.reachable(to.ip)?;
+        if self.is_local(to.ip) {
             if self.local.lock().is_none() {
-                let p = ephemeral();
+                let p = ephemeral(self.ns.ino);
                 *self.local.lock() = Some(Sin { ip: [127, 0, 0, 1], port: p });
-                UDP_PORTS.lock().insert(p, self.me.clone());
+                UDP_PORTS.lock().insert(self.key(p), self.me.clone());
             }
             let from = Sin { ip: [127, 0, 0, 1], port: self.local.lock().unwrap().port };
-            if let Some(t) = UDP_PORTS.lock().get(&to.port).and_then(|w| w.upgrade()) {
+            if let Some(t) = UDP_PORTS.lock().get(&self.key(to.port)).and_then(|w| w.upgrade()) {
                 t.udp_rx.lock().push_back((from, msg.data.clone()));
                 t.pq.notify(POLLIN);
             }

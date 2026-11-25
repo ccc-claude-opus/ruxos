@@ -202,8 +202,11 @@ pub fn sendmsg(fd: i32, msg: usize, flags: u32) -> Result<usize> {
                 m.fds.push(fds.get(fdn)?);
             }
         } else if level == SOL_SOCKET && ty == 2 {
+            // given in the sender's namespaces; kept as global ids
             let c: [u32; 3] = read_user(ctl + off + 16)?;
-            m.creds = Some((c[0], c[1], c[2]));
+            let cr = crate::task::current_proc().cred();
+            let pid = crate::task::gpid(c[0]).ok_or(EPERM)?;
+            m.creds = Some((pid, cr.user_ns.make_kuid(c[1]).ok_or(EINVAL)?, cr.user_ns.make_kgid(c[2]).ok_or(EINVAL)?));
         }
         off += (clen + 7) & !7;
     }
@@ -270,7 +273,7 @@ pub fn recvmsg(fd: i32, msg: usize, flags: u32) -> Result<usize> {
     }
     let passcred = s.getsockopt(SOL_SOCKET, SO_PASSCRED).map(|v| v.first().copied().unwrap_or(0) != 0).unwrap_or(false);
     if passcred && cbuf.len() + 32 <= ctllen {
-        let (p, u, g) = m.creds.unwrap_or((0, u32::MAX, u32::MAX));
+        let (p, u, g) = crate::task::view_creds(m.creds.unwrap_or((0, u32::MAX, u32::MAX)));
         cbuf.extend_from_slice(&28u64.to_le_bytes());
         cbuf.extend_from_slice(&SOL_SOCKET.to_le_bytes());
         cbuf.extend_from_slice(&2i32.to_le_bytes());

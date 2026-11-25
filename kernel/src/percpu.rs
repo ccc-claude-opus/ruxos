@@ -33,6 +33,10 @@ pub struct PerCpu {
     pub slice_end: UnsafeCell<u64>,
     /// Id of the user address space loaded in this CPU (0 = none).
     pub loaded_mm: core::sync::atomic::AtomicU64,
+    /// When the running task got the CPU (ticks), for CPU time accounting.
+    pub run_start: core::sync::atomic::AtomicU64,
+    /// Ticks at which throttled tasks (cpu.max) may run again (0 = none).
+    pub throttle_wake: core::sync::atomic::AtomicU64,
 }
 
 unsafe impl Sync for PerCpu {}
@@ -53,6 +57,8 @@ const INIT: PerCpu = PerCpu {
     timers: SpinLock::new(BTreeMap::new()),
     slice_end: UnsafeCell::new(0),
     loaded_mm: core::sync::atomic::AtomicU64::new(0),
+    run_start: core::sync::atomic::AtomicU64::new(0),
+    throttle_wake: core::sync::atomic::AtomicU64::new(0),
 };
 
 static mut CPUS: [PerCpu; MAX_CPUS] = [INIT; MAX_CPUS];

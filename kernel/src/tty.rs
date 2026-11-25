@@ -286,11 +286,14 @@ impl FileOps for TtyFile {
             }
             0x5413 => write_user(arg, &*tty.winsize.lock())?, // TIOCGWINSZ
             0x5414 => *tty.winsize.lock() = read_user(arg)?,  // TIOCSWINSZ
-            0x540f => write_user(arg, &(tty.pgrp.load(Ordering::Relaxed) as i32))?, // TIOCGPGRP
+            0x540f => write_user(arg, &(crate::task::vpid(tty.pgrp.load(Ordering::Relaxed)) as i32))?, // TIOCGPGRP
             0x5410 => {
                 // TIOCSPGRP
                 let pg: i32 = read_user(arg)?;
-                tty.pgrp.store(pg as u32, Ordering::Relaxed);
+                if pg < 0 {
+                    return Err(EINVAL);
+                }
+                tty.pgrp.store(crate::task::gpid(pg as u32).ok_or(ESRCH)?, Ordering::Relaxed);
             }
             0x5429 => {
                 // TIOCGSID
@@ -298,7 +301,7 @@ impl FileOps for TtyFile {
                 if sid == 0 {
                     return Err(ENOTTY);
                 }
-                write_user(arg, &(sid as i32))?
+                write_user(arg, &(crate::task::vpid(sid) as i32))?
             }
             0x540e => {
                 // TIOCSCTTY

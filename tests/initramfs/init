@@ -5,6 +5,7 @@
 export PATH=/bin
 mount -t devtmpfs devtmpfs /dev
 mount -t tmpfs tmpfs /tmp
+mkdir -p /proc /mnt && mount -t proc proc /proc
 fail() { echo "ruxos-test m2: FAIL $*"; poweroff -f; }
 t0=$(date +%s); sleep 1; t1=$(date +%s)
 [ $((t1 - t0)) -ge 1 ] && [ $((t1 - t0)) -le 2 ] || fail sleep
@@ -58,6 +59,10 @@ if [ -b /dev/vda ]; then
         chroot /mnt /usr/local/bin/node /tmp/net.js > /tmp/net.out 2>&1
         grep -v '^ok' /tmp/net.out
         grep -q '^net-test: ok' /tmp/net.out || fail net
+        cp /tests/forward.js /mnt/tmp/
+        chroot /mnt /usr/local/bin/node /tmp/forward.js ${forward:-3} > /tmp/forward.out 2>&1
+        cat /tmp/forward.out
+        grep -q '^forward-test: ok' /tmp/forward.out || fail forward
     else
         [ -x /mnt/bin/busybox ] && [ "$(chroot /mnt /bin/busybox echo hi)" = hi ] || fail ext4-exec
     fi

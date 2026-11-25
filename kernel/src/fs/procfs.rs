@@ -13,10 +13,11 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
 
-pub fn new() -> Arc<dyn FileSystem> {
+/// A proc instance shows the processes of the PID namespace of whoever mounted it.
+pub fn new(ns: Arc<crate::ns::PidNs>) -> Arc<dyn FileSystem> {
     let fs = Arc::new(pseudo::PseudoFs { name: "proc", dev: tmpfs::anon_dev(), magic: 0x9fa0, root: SpinLock::new(None) });
     let dev = fs.dev;
-    *fs.root.lock() = Some(dir(dev, 1, 0o555, root_lister(dev)));
+    *fs.root.lock() = Some(dir(dev, 1, 0o555, root_lister(dev, ns)));
     fs
 }
 
@@ -32,13 +33,20 @@ fn kb(pages: usize) -> usize {
     pages * 4
 }
 
-fn root_lister(dev: u64) -> Lister {
+fn root_lister(dev: u64, ns: Arc<crate::ns::PidNs>) -> Lister {
     alloc::boxed::Box::new(move || {
         let mut v: Vec<(Vec<u8>, Arc<dyn Inode>)> = Vec::new();
-        v.push(entry("self", link(dev, 2, alloc::boxed::Box::new(|| text(format!("{}", task::current_proc().pid))))));
+        let (n1, n2) = (ns.clone(), ns.clone());
+        v.push(entry("self", link(dev, 2, alloc::boxed::Box::new(move || {
+            let p = n1.local_of(task::current_proc().pid);
+            if p == 0 { Err(ENOENT) } else { text(format!("{}", p)) }
+        }))));
         v.push(entry(
             "thread-self",
-            link(dev, 3, alloc::boxed::Box::new(|| text(format!("{}/task/{}", task::current_proc().pid, crate::sched::current().tid)))),
+            link(dev, 3, alloc::boxed::Box::new(move || {
+                let (p, t) = (n2.local_of(task::current_proc().pid), n2.local_of(crate::sched::current().tid));
+                if p == 0 { Err(ENOENT) } else { text(format!("{}/task/{}", p, t)) }
+            })),
         ));
         v.push(entry("cmdline", f(dev, &[b"cmdline"], alloc::boxed::Box::new(|| text(format!("{}\n", crate::CMDLINE.get().copied().unwrap_or("")))))));
         v.push(entry("version", f(dev, &[b"version"], alloc::boxed::Box::new(|| text(format!("Linux version {} (ruxos) {}\n", crate::RELEASE, crate::VERSION))))));
@@ -60,10 +68,12 @@ fn root_lister(dev: u64) -> Lister {
         v.push(entry("mounts", link(dev, 4, alloc::boxed::Box::new(|| text(String::from("self/mounts"))))));
         v.push(entry("sys", dir(dev, ino_of(&[b"sys"]), 0o555, sys_lister(dev))));
         v.push(entry("net", link(dev, 5, alloc::boxed::Box::new(|| text(String::from("self/net"))))));
-        let procs: Vec<Arc<Process>> = PROCS.lock().values().filter_map(|w| w.upgrade()).collect();
+        // the processes of this instance's PID namespace (and the ones below it), by their pid here
+        let procs: Vec<Arc<Process>> = PROCS.lock().values().filter_map(|w| w.upgrade()).filter(|p| ns.contains(&p.pid_ns)).collect();
         for p in procs {
-            if !p.is_zombie() || true {
-                v.push((format!("{}", p.pid).into_bytes(), pid_dir(dev, p.pid, None)));
+            let local = ns.local_of(p.pid);
+            if local != 0 {
+                v.push((format!("{}", local).into_bytes(), pid_dir(dev, p.pid, None)));
             }
         }
         v
@@ -129,18 +139,11 @@ fn sys_lister(dev: u64) -> Lister {
                     Ok(h)
                 }),
                 Some(alloc::boxed::Box::new(|d: &[u8]| {
-                    if !task::current_proc().cred().capable(21) {
-                        return Err(EPERM);
-                    }
                     let mut h = d.to_vec();
                     while h.last().is_some_and(|c| *c == b'\n') {
                         h.pop();
                     }
-                    if h.len() > 64 {
-                        return Err(EINVAL);
-                    }
-                    *crate::syscall::proc::HOSTNAME.lock() = h;
-                    Ok(())
+                    crate::syscall::proc::set_hostname(h)
                 })))));
             let consts: [(&str, String); 11] = [
                 ("osrelease", String::from(crate::RELEASE)),
@@ -177,7 +180,27 @@ fn sys_lister(dev: u64) -> Lister {
         };
         alloc::vec![
             (b"kernel".to_vec(), kernel),
-            simple(&["sys", "user"], &[("max_user_namespaces", "0"), ("max_pid_namespaces", "0"), ("max_net_namespaces", "0"), ("max_mnt_namespaces", "0")]),
+            (b"user".to_vec(), dir(dev, ino_of(&[b"sys", b"user"]), 0o555, alloc::boxed::Box::new(move || {
+                // per user namespace: the caller's (user_namespaces(7)); writable by its CAP_SYS_RESOURCE
+                let mut v = alloc::vec![entry("max_user_namespaces", pseudo::file_mode_fn(dev, ino_of(&[b"sys", b"user", b"max_user_namespaces"]), userns_sysctl_mode,
+                    alloc::boxed::Box::new(|| text(format!("{}\n", task::current_proc().cred().user_ns.max_user_namespaces.load(Ordering::Relaxed)))),
+                    Some(alloc::boxed::Box::new(|d: &[u8]| {
+                        let c = task::current_proc().cred();
+                        if !c.own_capable(24) {
+                            return Err(EPERM);
+                        }
+                        let n: u32 = core::str::from_utf8(d).map_err(|_| EINVAL)?.trim().parse().map_err(|_| EINVAL)?;
+                        if n > i32::MAX as u32 {
+                            return Err(EINVAL);
+                        }
+                        c.user_ns.max_user_namespaces.store(n, Ordering::Relaxed);
+                        Ok(())
+                    }))))];
+                for n in ["max_pid_namespaces", "max_net_namespaces", "max_mnt_namespaces", "max_uts_namespaces", "max_ipc_namespaces", "max_cgroup_namespaces"] {
+                    v.push(entry(n, f(dev, &[b"sys", b"user", n.as_bytes()], alloc::boxed::Box::new(|| text(String::from("15000\n"))))));
+                }
+                v
+            }))),
             simple(&["sys", "vm"], &[("overcommit_memory", "0"), ("max_map_count", "65530"), ("mmap_min_addr", "4096"), ("swappiness", "60")]),
             simple(&["sys", "fs"], &[("file-max", "9223372036854775807"), ("nr_open", "1048576"), ("pipe-max-size", "1048576")]),
             (b"net".to_vec(), dir(dev, ino_of(&[b"sys", b"net"]), 0o555, alloc::boxed::Box::new(move || {
@@ -231,29 +254,36 @@ fn thread_of(pid: u32, tid: Option<u32>) -> Result<Arc<crate::sched::Task>> {
 
 fn pid_dir(dev: u64, pid: u32, tid: Option<u32>) -> Arc<dyn Inode> {
     let key = format!("{}/{}", pid, tid.unwrap_or(0));
-    dir(dev, ino_of(&[key.as_bytes()]), 0o555, alloc::boxed::Box::new(move || pid_entries(dev, pid, tid)))
+    pseudo::dir_owned(dev, ino_of(&[key.as_bytes()]), 0o555, alloc::boxed::Box::new(move || pid_entries(dev, pid, tid)), pid)
 }
 
 fn pid_entries(dev: u64, pid: u32, tid: Option<u32>) -> Vec<(Vec<u8>, Arc<dyn Inode>)> {
     let k = format!("{}/{}", pid, tid.unwrap_or(0));
     let kb_ = |n: &str| ino_of(&[k.as_bytes(), n.as_bytes()]);
     let generate = |g: fn(u32, Option<u32>) -> Result<Vec<u8>>| -> Gen { alloc::boxed::Box::new(move || g(pid, tid)) };
+    // the files belong to the process (its effective ids), as Linux's /proc/PID
+    let fo = |ino: u64, mode: u32, g: Gen, w: Option<pseudo::Writer>| pseudo::file_owned(dev, ino, mode, g, w, pid);
     let mut v = alloc::vec![
-        entry("stat", file(dev, kb_("stat"), 0o444, generate(pid_stat), None)),
-        entry("statm", file(dev, kb_("statm"), 0o444, generate(pid_statm), None)),
-        entry("status", file(dev, kb_("status"), 0o444, generate(pid_status), None)),
-        entry("maps", file(dev, kb_("maps"), 0o444, generate(pid_maps), None)),
-        entry("cmdline", file(dev, kb_("cmdline"), 0o444, generate(pid_cmdline), None)),
-        entry("environ", file(dev, kb_("environ"), 0o400, generate(pid_environ), None)),
-        entry("auxv", file(dev, kb_("auxv"), 0o400, generate(pid_auxv), None)),
-        entry("cgroup", file(dev, kb_("cgroup"), 0o444, alloc::boxed::Box::new(|| text(String::from("0::/\n"))), None)),
-        entry("mountinfo", file(dev, kb_("mountinfo"), 0o444, generate(|p, _| mounts(p, true)), None)),
-        entry("mounts", file(dev, kb_("mounts"), 0o444, generate(|p, _| mounts(p, false)), None)),
-        entry("limits", file(dev, kb_("limits"), 0o444, generate(pid_limits), None)),
-        entry("oom_score_adj", file(dev, kb_("oom_score_adj"), 0o644, alloc::boxed::Box::new(|| text(String::from("0\n"))), Some(alloc::boxed::Box::new(|_| Ok(()))))),
-        entry("syscall", file(dev, kb_("syscall"), 0o400, generate(pid_syscall), None)),
-        entry("wchan", file(dev, kb_("wchan"), 0o444, generate(pid_wchan), None)),
-        entry("comm", file(dev, kb_("comm"), 0o644, generate(pid_comm), Some(alloc::boxed::Box::new(move |d: &[u8]| {
+        entry("stat", fo(kb_("stat"), 0o444, generate(pid_stat), None)),
+        entry("statm", fo(kb_("statm"), 0o444, generate(pid_statm), None)),
+        entry("status", fo(kb_("status"), 0o444, generate(pid_status), None)),
+        entry("maps", fo(kb_("maps"), 0o444, generate(pid_maps), None)),
+        entry("cmdline", fo(kb_("cmdline"), 0o444, generate(pid_cmdline), None)),
+        entry("environ", fo(kb_("environ"), 0o400, generate(pid_environ), None)),
+        entry("auxv", fo(kb_("auxv"), 0o400, generate(pid_auxv), None)),
+        entry("cgroup", fo(kb_("cgroup"), 0o444, alloc::boxed::Box::new(move || Ok(crate::fs::cgroupfs::proc_cgroup(&*proc_of(pid)?))), None)),
+        entry("mountinfo", fo(kb_("mountinfo"), 0o444, generate(|p, _| mounts(p, true)), None)),
+        entry("mounts", fo(kb_("mounts"), 0o444, generate(|p, _| mounts(p, false)), None)),
+        entry("limits", fo(kb_("limits"), 0o444, generate(pid_limits), None)),
+        entry("oom_score_adj", fo(kb_("oom_score_adj"), 0o644, alloc::boxed::Box::new(|| text(String::from("0\n"))), Some(alloc::boxed::Box::new(|_| Ok(()))))),
+        entry("syscall", fo(kb_("syscall"), 0o400, generate(pid_syscall), None)),
+        // user namespaces (user_namespaces(7))
+        entry("uid_map", fo(kb_("uid_map"), 0o644, generate(|p, t| id_map(p, t, false)), Some(alloc::boxed::Box::new(move |d: &[u8]| write_id_map(pid, tid, false, d))))),
+        entry("gid_map", fo(kb_("gid_map"), 0o644, generate(|p, t| id_map(p, t, true)), Some(alloc::boxed::Box::new(move |d: &[u8]| write_id_map(pid, tid, true, d))))),
+        entry("setgroups", fo(kb_("setgroups"), 0o644, generate(setgroups_read), Some(alloc::boxed::Box::new(move |d: &[u8]| setgroups_write(pid, tid, d))))),
+        entry("ns", pseudo::dir_owned(dev, kb_("ns"), 0o511, alloc::boxed::Box::new(move || ns_entries(dev, pid, tid)), pid)),
+        entry("wchan", fo(kb_("wchan"), 0o444, generate(pid_wchan), None)),
+        entry("comm", fo(kb_("comm"), 0o644, generate(pid_comm), Some(alloc::boxed::Box::new(move |d: &[u8]| {
             let t = thread_of(pid, tid)?;
             let th = task::thread_of(&t).ok_or(ESRCH)?;
             let mut n = [0u8; 16];
@@ -262,28 +292,47 @@ fn pid_entries(dev: u64, pid: u32, tid: Option<u32>) -> Vec<(Vec<u8>, Arc<dyn In
             *th.comm.lock() = n;
             Ok(())
         })))),
-        entry("exe", link(dev, kb_("exe"), alloc::boxed::Box::new(move || {
+        // exe, cwd, root: magic links (path walking goes to the object itself)
+        entry("exe", pseudo::magic_link(dev, kb_("exe"), alloc::boxed::Box::new(move || {
             let t = thread_of(pid, tid)?;
             let th = task::thread_of(&t).ok_or(ENOENT)?;
             let exe = th.mm.inner.lock().exe.clone().ok_or(ENOENT)?;
-            let root = th.fs.lock().root.clone();
-            Ok(exe.path_from(&root))
-        }))),
-        entry("cwd", link(dev, kb_("cwd"), alloc::boxed::Box::new(move || {
+            Ok(exe.path_from(&reader_root()))
+        }), alloc::boxed::Box::new(move || {
             let t = thread_of(pid, tid)?;
             let th = task::thread_of(&t).ok_or(ENOENT)?;
-            let f = th.fs.lock();
-            Ok(f.cwd.path_from(&f.root))
-        }))),
-        entry("root", link(dev, kb_("root"), alloc::boxed::Box::new(|| Ok(b"/".to_vec())))),
-        entry("fd", dir(dev, kb_("fd"), 0o500, alloc::boxed::Box::new(move || fd_entries(dev, pid, tid)))),
+            th.mm.inner.lock().exe.clone().ok_or(ENOENT)
+        }), pid)),
+        entry("cwd", pseudo::magic_link(dev, kb_("cwd"), alloc::boxed::Box::new(move || {
+            let t = thread_of(pid, tid)?;
+            let th = task::thread_of(&t).ok_or(ENOENT)?;
+            let cwd = th.fs.lock().cwd.clone();
+            Ok(cwd.path_from(&reader_root()))
+        }), alloc::boxed::Box::new(move || {
+            let t = thread_of(pid, tid)?;
+            let th = task::thread_of(&t).ok_or(ENOENT)?;
+            let cwd = th.fs.lock().cwd.clone();
+            Ok(cwd)
+        }), pid)),
+        entry("root", pseudo::magic_link(dev, kb_("root"), alloc::boxed::Box::new(move || {
+            let t = thread_of(pid, tid)?;
+            let th = task::thread_of(&t).ok_or(ENOENT)?;
+            let r = th.fs.lock().root.clone();
+            Ok(r.path_from(&reader_root()))
+        }), alloc::boxed::Box::new(move || {
+            let t = thread_of(pid, tid)?;
+            let th = task::thread_of(&t).ok_or(ENOENT)?;
+            let r = th.fs.lock().root.clone();
+            Ok(r)
+        }), pid)),
+        entry("fd", pseudo::dir_owned(dev, kb_("fd"), 0o500, alloc::boxed::Box::new(move || fd_entries(dev, pid, tid)), pid)),
         entry("net", link(dev, kb_("net"), alloc::boxed::Box::new(|| Ok(b"/sys/class/net".to_vec())))),
     ];
     if tid.is_none() {
         v.push(entry("task", dir(dev, kb_("task"), 0o555, alloc::boxed::Box::new(move || {
             let Ok(p) = proc_of(pid) else { return Vec::new() };
             let ts: Vec<u32> = p.threads.lock().iter().filter_map(|w| w.upgrade()).map(|t| t.tid).collect();
-            ts.into_iter().map(|t| (format!("{}", t).into_bytes(), pid_dir(dev, pid, Some(t)))).collect()
+            ts.into_iter().map(|t| (format!("{}", task::vpid(t)).into_bytes(), pid_dir(dev, pid, Some(t)))).collect()
         }))));
     }
     v
@@ -293,15 +342,28 @@ fn fd_entries(dev: u64, pid: u32, tid: Option<u32>) -> Vec<(Vec<u8>, Arc<dyn Ino
     let Ok(t) = thread_of(pid, tid) else { return Vec::new() };
     let Some(th) = task::thread_of(&t) else { return Vec::new() };
     let fds = th.files.lock().clone();
-    let root = th.fs.lock().root.clone();
     let mut v = Vec::new();
     for (i, e) in fds.fds.iter().enumerate() {
         let Some(e) = e else { continue };
-        let file = e.file.clone();
-        let root = root.clone();
-        v.push((format!("{}", i).into_bytes(), link(dev, ino_of(&[b"fd", format!("{}/{}", pid, i).as_bytes()]), alloc::boxed::Box::new(move || Ok(fd_target(&file, &root))))));
+        let (f1, f2) = (e.file.clone(), e.file.clone());
+        // a magic link: opening it reaches the open file's object, wherever it is
+        v.push((
+            format!("{}", i).into_bytes(),
+            pseudo::magic_link(
+                dev,
+                ino_of(&[b"fd", format!("{}/{}", pid, i).as_bytes()]),
+                alloc::boxed::Box::new(move || Ok(fd_target(&f1, &reader_root()))),
+                alloc::boxed::Box::new(move || f2.path.clone().ok_or(ENOENT)),
+                pid,
+            ),
+        ));
     }
     v
+}
+
+/// The root of whoever reads a link (paths are shown relative to it, as d_path).
+fn reader_root() -> PathRef {
+    task::current_thread().fs.lock().root.clone()
 }
 
 /// What /proc/PID/fd/N points to.
@@ -384,9 +446,84 @@ fn pid_wchan(pid: u32, tid: Option<u32>) -> Result<Vec<u8>> {
     text(String::from(name))
 }
 
-fn rss_pages(p: &Process) -> usize {
-    let _ = p;
-    0
+/// /proc/sys/user: read-write for whoever has CAP_SYS_RESOURCE over its user namespace (the
+/// caller's), read-only for the others (Linux's set_permissions in kernel/ucount.c).
+fn userns_sysctl_mode() -> u32 {
+    if task::current_proc().cred().own_capable(24) { 0o666 } else { 0o444 }
+}
+
+fn user_ns_of(pid: u32) -> Result<Arc<crate::ns::UserNs>> {
+    Ok(proc_of(pid)?.cred().user_ns.clone())
+}
+
+fn id_map(pid: u32, _tid: Option<u32>, gid: bool) -> Result<Vec<u8>> {
+    let ns = user_ns_of(pid)?;
+    let reader = task::current_proc().cred().user_ns.clone();
+    Ok(crate::ns::read_map(&ns, gid, &reader))
+}
+
+fn write_id_map(pid: u32, _tid: Option<u32>, gid: bool, d: &[u8]) -> Result<()> {
+    let ns = user_ns_of(pid)?;
+    crate::ns::write_map(&ns, gid, d, &task::current_proc().cred())
+}
+
+fn setgroups_read(pid: u32, _tid: Option<u32>) -> Result<Vec<u8>> {
+    let ns = user_ns_of(pid)?;
+    text(String::from(if ns.setgroups_allowed.load(Ordering::Relaxed) { "allow\n" } else { "deny\n" }))
+}
+
+/// /proc/PID/setgroups: "deny" before gid_map is written (and only by someone who could write it);
+/// "allow" is only accepted while it still is.
+fn setgroups_write(pid: u32, _tid: Option<u32>, d: &[u8]) -> Result<()> {
+    let ns = user_ns_of(pid)?;
+    let w = core::str::from_utf8(d).map_err(|_| EINVAL)?.trim();
+    let allow = match w {
+        "allow" => true,
+        "deny" => false,
+        _ => return Err(EINVAL),
+    };
+    let cred = task::current_proc().cred();
+    let parent = ns.parent.clone().ok_or(EPERM)?;
+    if !(Arc::ptr_eq(&cred.user_ns, &ns) || Arc::ptr_eq(&cred.user_ns, &parent)) {
+        return Err(EPERM);
+    }
+    if allow {
+        if !ns.setgroups_allowed.load(Ordering::Relaxed) {
+            return Err(EPERM);
+        }
+    } else {
+        if ns.gid_map.lock().is_some() {
+            return Err(EPERM);
+        }
+        ns.setgroups_allowed.store(false, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// /proc/PID/ns: "type:[inode]" links (namespaces(7)).
+fn ns_entries(dev: u64, pid: u32, tid: Option<u32>) -> Vec<(Vec<u8>, Arc<dyn Inode>)> {
+    let Ok(p) = proc_of(pid) else { return Vec::new() };
+    let n = p.ns.lock().clone();
+    let k = format!("{}/{}/ns", pid, tid.unwrap_or(0));
+    let items: [(&str, u64); 9] = [
+        ("cgroup", n.cgroup.ino),
+        ("ipc", n.ipc.ino),
+        ("mnt", n.mnt.ino),
+        ("net", n.net.ino),
+        ("pid", p.pid_ns.ino),
+        ("pid_for_children", n.pid_for_children.ino),
+        ("time", crate::ns::INO_TIME),
+        ("time_for_children", crate::ns::INO_TIME),
+        ("user", p.cred().user_ns.ino),
+    ];
+    items
+        .iter()
+        .map(|(name, ino)| {
+            let kind = if name.starts_with("pid") { "pid" } else if name.starts_with("time") { "time" } else { name };
+            let s = format!("{}:[{}]", kind, ino);
+            (name.as_bytes().to_vec(), link(dev, ino_of(&[k.as_bytes(), name.as_bytes()]), alloc::boxed::Box::new(move || Ok(s.clone().into_bytes()))))
+        })
+        .collect()
 }
 
 fn pid_stat(pid: u32, tid: Option<u32>) -> Result<Vec<u8>> {
@@ -394,7 +531,7 @@ fn pid_stat(pid: u32, tid: Option<u32>) -> Result<Vec<u8>> {
     let t = thread_of(pid, tid)?;
     let th = task::thread_of(&t).ok_or(ENOENT)?;
     let state = if p.is_zombie() { 'Z' } else if t.state.load(Ordering::Relaxed) == crate::sched::SLEEPING { 'S' } else { 'R' };
-    let ppid = p.parent().map_or(0, |x| x.pid);
+    let ppid = p.parent().map_or(0, |x| task::vpid(x.pid));
     let nthreads = p.threads.lock().len();
     let start = crate::time::ticks_to_ns(p.start_ticks) / 10_000_000;
     let (vsize, start_stack, brk_start, brk, arg_s, arg_e, env_s, env_e) = {
@@ -402,15 +539,15 @@ fn pid_stat(pid: u32, tid: Option<u32>) -> Result<Vec<u8>> {
         let vs: usize = m.vmas.values().map(|v| v.end - v.start).sum();
         (vs, m.stack_top, m.brk_start, m.brk, m.arg_start, m.arg_end, m.env_start, m.env_end)
     };
-    let rss = rss_pages(&p);
+    let rss = p.mm_pages();
     // the 52 fields of proc(5)
     let fields: [u64; 49] = [
-        ppid as u64, p.pgid.load(Ordering::Relaxed) as u64, p.sid.load(Ordering::Relaxed) as u64, 0, u64::MAX, 4194560,
+        ppid as u64, task::vpid(p.pgid.load(Ordering::Relaxed)) as u64, task::vpid(p.sid.load(Ordering::Relaxed)) as u64, 0, u64::MAX, 4194560,
         0, 0, 0, 0, 0, 0, 0, 0, 20, 0, nthreads as u64, 0, start, vsize as u64, rss as u64, u64::MAX,
         0, 0, start_stack as u64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 17, t.cpu.load(Ordering::Relaxed) as u64, 0, 0, 0, 0, 0,
         0, 0, brk_start as u64, brk as u64, arg_s as u64, arg_e as u64, env_s as u64, env_e as u64,
     ];
-    let mut out = format!("{} ({}) {}", t.tid, comm(&t), state);
+    let mut out = format!("{} ({}) {}", task::vpid(t.tid), comm(&t), state);
     for (i, v) in fields.iter().enumerate() {
         if i == 4 {
             out.push_str(" -1"); // tpgid
@@ -452,14 +589,33 @@ fn pid_status(pid: u32, tid: Option<u32>) -> Result<Vec<u8>> {
     };
     let vsize: usize = th.mm.inner.lock().vmas.values().map(|v| v.end - v.start).sum();
     let state = if p.is_zombie() { "Z (zombie)" } else if t.state.load(Ordering::Relaxed) == crate::sched::SLEEPING { "S (sleeping)" } else { "R (running)" };
-    let groups: Vec<String> = c.groups.iter().map(|g| format!("{}", g)).collect();
+    // ids as the reader sees them
+    let un = task::current_proc().cred().user_ns.clone();
+    let groups: Vec<String> = c.groups.iter().map(|g| format!("{}", un.from_kgid(*g))).collect();
+    let v = task::vpid;
+    // NSpid and friends: the ids from the reader's PID namespace down to the process's own
+    let nsids = |g: u32| -> String {
+        let me = task::current_proc().pid_ns.clone();
+        let mut chain = Vec::new();
+        let mut n = Some(p.pid_ns.clone());
+        while let Some(x) = n {
+            chain.push(x.clone());
+            if Arc::ptr_eq(&x, &me) {
+                break;
+            }
+            n = x.parent.clone();
+        }
+        chain.iter().rev().map(|x| format!("{}", x.local_of(g))).collect::<Vec<_>>().join("\t")
+    };
+    let seccomp = th.seccomp_mode.load(Ordering::Relaxed);
     text(format!(
-        "Name:\t{}\nUmask:\t{:04o}\nState:\t{}\nTgid:\t{}\nNgid:\t0\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{}\nGroups:\t{}\nNStgid:\t{}\nNSpid:\t{}\nNSpgid:\t{}\nNSsid:\t{}\nVmPeak:\t{:8} kB\nVmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\nSigQ:\t0/63000\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t0000000000000000\nNoNewPrivs:\t{}\nSeccomp:\t0\nCpus_allowed:\t{:x}\nCpus_allowed_list:\t0-{}\n",
-        comm(&t), th.fs.lock().umask, state, p.pid, t.tid, p.parent().map_or(0, |x| x.pid),
-        c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid,
-        th.files.lock().fds.len().max(64), groups.join(" "), p.pid, t.tid, p.pgid.load(Ordering::Relaxed), p.sid.load(Ordering::Relaxed),
-        vsize / 1024, vsize / 1024, 0, p.threads.lock().len(),
-        pending, shared, blocked, ign, cgt, c.cap_inh, c.cap_perm, c.cap_eff, c.cap_bnd, c.no_new_privs as u32,
+        "Name:\t{}\nUmask:\t{:04o}\nState:\t{}\nTgid:\t{}\nNgid:\t0\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{}\nGroups:\t{}\nNStgid:\t{}\nNSpid:\t{}\nNSpgid:\t{}\nNSsid:\t{}\nVmPeak:\t{:8} kB\nVmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\nSigQ:\t0/63000\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\nNoNewPrivs:\t{}\nSeccomp:\t{}\nCpus_allowed:\t{:x}\nCpus_allowed_list:\t0-{}\n",
+        comm(&t), th.fs.lock().umask, state, v(p.pid), v(t.tid), p.parent().map_or(0, |x| v(x.pid)),
+        un.from_kuid(c.uid), un.from_kuid(c.euid), un.from_kuid(c.suid), un.from_kuid(c.fsuid),
+        un.from_kgid(c.gid), un.from_kgid(c.egid), un.from_kgid(c.sgid), un.from_kgid(c.fsgid),
+        th.files.lock().fds.len().max(64), groups.join(" "), nsids(p.pid), nsids(t.tid), nsids(p.pgid.load(Ordering::Relaxed)), nsids(p.sid.load(Ordering::Relaxed)),
+        vsize / 1024, vsize / 1024, p.mm_pages() * 4, p.threads.lock().len(),
+        pending, shared, blocked, ign, cgt, c.cap_inh, c.cap_perm, c.cap_eff, c.cap_bnd, c.cap_amb, c.no_new_privs as u32, seccomp,
         (1u64 << crate::percpu::ncpus()) - 1, crate::percpu::ncpus() - 1
     ))
 }

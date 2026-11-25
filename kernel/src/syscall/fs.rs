@@ -58,14 +58,14 @@ pub fn lookup_at(dirfd: i32, path: &[u8], follow: bool, empty_ok: bool) -> Resul
     let c = cred();
     let r = root();
     let st = start(dirfd)?;
-    Lookup { root: &r, cred: &c, follow_last: follow, beneath: false, no_symlinks: false }.resolve(&st, path)
+    Lookup { root: &r, cred: &c, follow_last: follow, beneath: false, no_symlinks: false, no_magiclinks: false, no_xdev: false }.resolve(&st, path)
 }
 
 fn parent_at(dirfd: i32, path: &[u8]) -> Result<(PathRef, Vec<u8>, bool)> {
     let c = cred();
     let r = root();
     let st = start(dirfd)?;
-    Lookup { root: &r, cred: &c, follow_last: true, beneath: false, no_symlinks: false }.resolve_parent(&st, path)
+    Lookup { root: &r, cred: &c, follow_last: true, beneath: false, no_symlinks: false, no_magiclinks: false, no_xdev: false }.resolve_parent(&st, path)
 }
 
 fn check_writable_mount(p: &PathRef) -> Result<()> {
@@ -74,16 +74,37 @@ fn check_writable_mount(p: &PathRef) -> Result<()> {
 
 /// Opens (dirfd, path) with open(2) flags.
 pub fn open_path(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<File>> {
+    open_how(dirfd, path, flags, mode, 0)
+}
+
+pub const RESOLVE_NO_XDEV: u64 = 1;
+pub const RESOLVE_NO_MAGICLINKS: u64 = 2;
+pub const RESOLVE_NO_SYMLINKS: u64 = 4;
+pub const RESOLVE_BENEATH: u64 = 8;
+pub const RESOLVE_IN_ROOT: u64 = 0x10;
+pub const RESOLVE_CACHED: u64 = 0x20;
+
+/// open with openat2(2) resolve flags.
+fn open_how(dirfd: i32, path: &[u8], flags: u32, mode: u32, resolve: u64) -> Result<Arc<File>> {
     if path.is_empty() {
         return Err(ENOENT);
     }
     let c = cred();
     let th = current_thread();
     let umask = th.fs.lock().umask;
-    let r = root();
     let st = start(dirfd)?;
+    // RESOLVE_IN_ROOT / RESOLVE_BENEATH: the start directory is the root of the lookup
+    let r = if resolve & (RESOLVE_IN_ROOT | RESOLVE_BENEATH) != 0 { st.clone() } else { root() };
     let follow = flags & O_NOFOLLOW == 0;
-    let lk = Lookup { root: &r, cred: &c, follow_last: follow, beneath: false, no_symlinks: false };
+    let lk = Lookup {
+        root: &r,
+        cred: &c,
+        follow_last: follow,
+        beneath: resolve & RESOLVE_BENEATH != 0,
+        no_symlinks: resolve & RESOLVE_NO_SYMLINKS != 0,
+        no_magiclinks: resolve & RESOLVE_NO_MAGICLINKS != 0,
+        no_xdev: resolve & RESOLVE_NO_XDEV != 0,
+    };
     let mut created = false;
     let p = if flags & O_CREAT != 0 {
         let (dir, name, trailing) = lk.resolve_parent(&st, path)?;
@@ -158,6 +179,44 @@ pub fn open_path(dirfd: i32, path: &[u8], flags: u32, mode: u32) -> Result<Arc<F
 pub fn openat(dirfd: i32, path: usize, flags: u32, mode: u32) -> Result<usize> {
     let path = user_path(path)?;
     let f = open_path(dirfd, &path, flags, mode)?;
+    let th = current_thread();
+    let mut fds = th.files.lock();
+    fds.limit = th.proc.rlimit(crate::task::RLIMIT_NOFILE).0.min(1 << 20) as usize;
+    Ok(fds.alloc(f, 0, flags & O_CLOEXEC != 0)? as usize)
+}
+
+/// openat2(2): struct open_how { u64 flags; u64 mode; u64 resolve; } (larger structs must be zero
+/// beyond what we know).
+pub fn openat2(dirfd: i32, path: usize, how: usize, size: usize) -> Result<usize> {
+    if size < 24 {
+        return Err(EINVAL);
+    }
+    if size > 4096 {
+        return Err(E2BIG);
+    }
+    let h: [u64; 3] = read_user(how)?;
+    for off in (24..size).step_by(8) {
+        let rest = (size - off).min(8);
+        let mut b = [0u8; 8];
+        copy_from_user(&mut b[..rest], how + off)?;
+        if b.iter().any(|&x| x != 0) {
+            return Err(E2BIG);
+        }
+    }
+    let [flags, mode, resolve] = h;
+    if flags >> 32 != 0 || resolve & !(RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH | RESOLVE_IN_ROOT | RESOLVE_CACHED) != 0 {
+        return Err(EINVAL);
+    }
+    if resolve & RESOLVE_BENEATH != 0 && resolve & RESOLVE_IN_ROOT != 0 {
+        return Err(EINVAL);
+    }
+    let flags = flags as u32;
+    // the mode only goes with O_CREAT / O_TMPFILE, and must be a mode
+    if mode & !0o7777 != 0 || (mode != 0 && flags & (O_CREAT | 0o20000000) == 0) {
+        return Err(EINVAL);
+    }
+    let path = user_path(path)?;
+    let f = open_how(dirfd, &path, flags, mode as u32, resolve)?;
     let th = current_thread();
     let mut fds = th.files.lock();
     fds.limit = th.proc.rlimit(crate::task::RLIMIT_NOFILE).0.min(1 << 20) as usize;
@@ -480,7 +539,19 @@ pub fn pipe2(fds_ptr: usize, flags: u32) -> Result<usize> {
     Ok(0)
 }
 
+/// The owner of a file as the caller sees it (its user namespace; unmapped ids read 65534).
+fn view_owner(s: &Stat) -> (u32, u32) {
+    match crate::task::try_current_proc() {
+        Some(p) => {
+            let c = p.cred.lock();
+            (c.user_ns.from_kuid(s.uid), c.user_ns.from_kgid(s.gid))
+        }
+        None => (s.uid, s.gid),
+    }
+}
+
 pub fn stat_bytes(s: &Stat) -> [u8; 128] {
+    let (uid, gid) = view_owner(s);
     let mut b = [0u8; 128];
     let p64 = |b: &mut [u8; 128], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
     let p32 = |b: &mut [u8; 128], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
@@ -488,8 +559,8 @@ pub fn stat_bytes(s: &Stat) -> [u8; 128] {
     p64(&mut b, 8, s.ino);
     p32(&mut b, 16, s.mode);
     p32(&mut b, 20, s.nlink);
-    p32(&mut b, 24, s.uid);
-    p32(&mut b, 28, s.gid);
+    p32(&mut b, 24, uid);
+    p32(&mut b, 28, gid);
     p64(&mut b, 32, s.rdev);
     p64(&mut b, 48, s.size);
     p32(&mut b, 56, s.blksize);
@@ -537,8 +608,9 @@ pub fn statx(dirfd: i32, path: usize, flags: u32, _mask: u32, buf: usize) -> Res
     p32(&mut b, 0, 0x7ff | 0x800 | 0x1000);
     p32(&mut b, 4, s.blksize);
     p32(&mut b, 16, s.nlink);
-    p32(&mut b, 20, s.uid);
-    p32(&mut b, 24, s.gid);
+    let (uid, gid) = view_owner(&s);
+    p32(&mut b, 20, uid);
+    p32(&mut b, 24, gid);
     b[28..30].copy_from_slice(&(s.mode as u16).to_le_bytes());
     p64(&mut b, 32, s.ino);
     p64(&mut b, 40, s.size);
@@ -630,7 +702,7 @@ pub fn fchdir(fd: i32) -> Result<usize> {
 }
 
 pub fn chroot(path: usize) -> Result<usize> {
-    if !cred().capable(18) {
+    if !cred().own_capable(18) {
         return Err(EPERM);
     }
     let path = user_path(path)?;
@@ -876,9 +948,12 @@ pub fn fchmodat(dirfd: i32, path: usize, mode: u32, flags: u32) -> Result<usize>
 fn chown_inode(i: &Arc<dyn Inode>, uid: u32, gid: u32) -> Result<usize> {
     let c = cred();
     let s = i.stat()?;
-    let uid = if uid == u32::MAX { None } else { Some(uid) };
-    let gid = if gid == u32::MAX { None } else { Some(gid) };
-    if !c.capable(0) {
+    // ids of the caller's user namespace, as kernel ids
+    let uid = if uid == u32::MAX { None } else { Some(c.user_ns.make_kuid(uid).ok_or(EINVAL)?) };
+    let gid = if gid == u32::MAX { None } else { Some(c.user_ns.make_kgid(gid).ok_or(EINVAL)?) };
+    // CAP_CHOWN counts for files whose owner and group are mapped in the caller's namespace
+    let mapped = c.user_ns.uid_in(s.uid).is_some() && c.user_ns.gid_in(s.gid).is_some();
+    if !(c.own_capable(0) && mapped) {
         if uid.is_some_and(|u| u != s.uid) || (c.fsuid != s.uid) {
             return Err(EPERM);
         }
@@ -1074,24 +1149,90 @@ fn mnt_flags(f: u64) -> u32 {
     m
 }
 
-pub fn mount(src: usize, target: usize, fstype: usize, flags: u64, data: usize) -> Result<usize> {
-    if !cred().capable(21) {
+/// The caller's mount namespace, after checking CAP_SYS_ADMIN over it (mount_namespaces(7)).
+fn mnt_ns_admin() -> Result<Arc<path::MntNs>> {
+    let p = crate::task::current_proc();
+    let ns = p.ns.lock().mnt.clone();
+    if !p.cred().ns_capable(&ns.user_ns, 21) {
         return Err(EPERM);
+    }
+    Ok(ns)
+}
+
+/// Whether `m` is in namespace `ns`.
+fn in_ns(m: &Arc<Mount>, ns: &Arc<path::MntNs>) -> bool {
+    m.ns.lock().upgrade().is_some_and(|n| Arc::ptr_eq(&n, ns))
+}
+
+/// A mount below `at` (within the subtree of `m` under dentry `at`) that a less privileged namespace
+/// may not separate from its parent.
+fn has_locked_children(m: &Arc<Mount>, at: &Arc<path::DEntry>) -> bool {
+    m.children.lock().iter().any(|k| {
+        let Some(mp) = k.parent.lock().as_ref().map(|(_, d)| d.clone()) else { return false };
+        let mut d = Some(mp);
+        while let Some(x) = d {
+            if Arc::ptr_eq(&x, at) {
+                return k.locked.load(core::sync::atomic::Ordering::Relaxed) & path::MNT_LOCKED != 0;
+            }
+            d = x.parent();
+        }
+        false
+    })
+}
+
+/// File systems a user namespace may mount (FS_USERNS_MOUNT in Linux).
+fn userns_mountable(fstype: &[u8]) -> bool {
+    matches!(fstype, b"tmpfs" | b"ramfs" | b"proc" | b"sysfs" | b"devpts" | b"cgroup2" | b"mqueue")
+}
+
+pub fn mount(src: usize, target: usize, fstype: usize, mut flags: u64, data: usize) -> Result<usize> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let ns = mnt_ns_admin()?;
+    // the old magic number in the upper half (MS_MGC_VAL) is ignored, as by Linux
+    if flags & 0xffff_0000 == 0xc0ed_0000 {
+        flags &= 0xffff;
     }
     let target = user_path(target)?;
     let src = if src != 0 { user_path(src)? } else { Vec::new() };
     let fstype = if fstype != 0 { user_path(fstype)? } else { Vec::new() };
     let data = if data != 0 { read_cstr(data, 4096).unwrap_or_default() } else { Vec::new() };
     let tp = lookup_at(AT_FDCWD, &target, true, false)?;
+    if !in_ns(&tp.mnt, &ns) {
+        return Err(EINVAL);
+    }
+    let userns = !ns.user_ns.is_init();
     if flags & (MS_PRIVATE | MS_SLAVE | MS_SHARED | MS_UNBINDABLE) != 0 && flags & (MS_BIND | MS_MOVE | MS_REMOUNT) == 0 {
-        return Ok(0); // propagation types: every mount is private here
+        // propagation types: every mount is private here
+        return Ok(0);
     }
     if flags & MS_REMOUNT != 0 {
         let m = &tp.mnt;
         if !Arc::ptr_eq(&tp.d, &m.root) {
             return Err(EINVAL);
         }
-        m.flags.store(mnt_flags(flags), core::sync::atomic::Ordering::Relaxed);
+        let mut new = mnt_flags(flags);
+        // the access time mode stays unless one is given
+        if flags & (MS_NOATIME | MS_RELATIME | MS_STRICTATIME) == 0 {
+            new |= m.flags() & (path::MNT_NOATIME | path::MNT_RELATIME);
+        }
+        // flags locked by a more privileged namespace cannot be cleared
+        let locked = m.locked.load(Relaxed) & path::MNT_LOCK_FLAGS;
+        if locked & !new & (MNT_RDONLY | path::MNT_NOSUID | path::MNT_NODEV | path::MNT_NOEXEC) != 0 {
+            return Err(EPERM);
+        }
+        if locked & (path::MNT_NOATIME | path::MNT_RELATIME) != 0 && (new ^ m.flags()) & (path::MNT_NOATIME | path::MNT_RELATIME) != 0 {
+            return Err(EPERM);
+        }
+        if flags & MS_BIND != 0 {
+            // MS_BIND | MS_REMOUNT: this mount's flags only
+            m.flags.store(new, Relaxed);
+            return Ok(0);
+        }
+        // the file system itself (its superblock): ext4 belongs to the initial user namespace
+        if m.fstype.starts_with("ext") && !cred().capable(21) {
+            return Err(EPERM);
+        }
+        m.flags.store(new, Relaxed);
         if flags & MS_RDONLY != 0 {
             m.root.fs.unmount()?;
         }
@@ -1099,8 +1240,19 @@ pub fn mount(src: usize, target: usize, fstype: usize, flags: u64, data: usize) 
     }
     if flags & MS_MOVE != 0 {
         let sp = lookup_at(AT_FDCWD, &src, true, false)?;
-        if !Arc::ptr_eq(&sp.d, &sp.mnt.root) || sp.mnt.parent.lock().is_none() {
+        if !Arc::ptr_eq(&sp.d, &sp.mnt.root) || sp.mnt.parent.lock().is_none() || !in_ns(&sp.mnt, &ns) {
             return Err(EINVAL);
+        }
+        if sp.mnt.locked.load(Relaxed) & path::MNT_LOCKED != 0 {
+            return Err(EINVAL);
+        }
+        // not into itself
+        let mut up = Some(tp.mnt.clone());
+        while let Some(x) = up {
+            if Arc::ptr_eq(&x, &sp.mnt) {
+                return Err(ELOOP);
+            }
+            up = x.parent.lock().as_ref().map(|(p, _)| p.clone());
         }
         let m = sp.mnt.clone();
         m.detach();
@@ -1109,21 +1261,48 @@ pub fn mount(src: usize, target: usize, fstype: usize, flags: u64, data: usize) 
     }
     if flags & MS_BIND != 0 {
         let sp = lookup_at(AT_FDCWD, &src, true, false)?;
-        let m = Mount::new(sp.d.clone(), mnt_flags(flags), &sp.mnt.source, &sp.mnt.fstype, &sp.mnt.options);
-        tp.mnt.attach(&tp.d, &m);
-        if flags & MS_REC != 0 {
+        if !in_ns(&sp.mnt, &ns) {
+            return Err(EINVAL);
+        }
+        let rec = flags & MS_REC != 0;
+        if !rec && has_locked_children(&sp.mnt, &sp.d) {
+            return Err(EINVAL);
+        }
+        // the new mount has the source mount's flags (and its locks)
+        let m = Mount::new(sp.d.clone(), sp.mnt.flags(), &sp.mnt.source, &sp.mnt.fstype, &sp.mnt.options);
+        m.locked.store(sp.mnt.locked.load(Relaxed) & path::MNT_LOCK_FLAGS, Relaxed);
+        // copy the source's submounts before attaching (a bind onto itself must not copy itself)
+        if rec {
             bind_children(&sp, &m);
         }
+        tp.mnt.attach(&tp.d, &m);
         return Ok(0);
     }
+    if userns && !userns_mountable(&fstype) {
+        return Err(EPERM);
+    }
+    if fstype == b"proc" && !cred().ns_capable(&crate::task::current_proc().pid_ns.user_ns, 21) {
+        return Err(EPERM);
+    }
+    if fstype == b"sysfs" && !cred().ns_capable(&crate::task::current_proc().ns.lock().net.user_ns, 21) {
+        return Err(EPERM);
+    }
     let fs = crate::fs::make_fs(&fstype, &src, &data, flags & MS_RDONLY != 0)?;
-    let m = Mount::new(path::DEntry::new_root(fs), mnt_flags(flags), core::str::from_utf8(&src).unwrap_or(""), core::str::from_utf8(&fstype).unwrap_or(""), core::str::from_utf8(&data).unwrap_or(""));
+    let mut mf = mnt_flags(flags);
+    let m = Mount::new(path::DEntry::new_root(fs), 0, core::str::from_utf8(&src).unwrap_or(""), core::str::from_utf8(&fstype).unwrap_or(""), core::str::from_utf8(&data).unwrap_or(""));
+    if userns {
+        // device nodes of a file system mounted in a user namespace do not work (SB_I_NODEV)
+        mf |= path::MNT_NODEV;
+        m.locked.store(path::MNT_NODEV, Relaxed);
+    }
+    m.flags.store(mf, Relaxed);
     tp.mnt.attach(&tp.d, &m);
     Ok(0)
 }
 
 /// MS_BIND | MS_REC: the mounts inside the source tree appear inside the new bind mount too.
 fn bind_children(src: &PathRef, newm: &Arc<Mount>) {
+    use core::sync::atomic::Ordering::Relaxed;
     let kids: Vec<Arc<Mount>> = src.mnt.children.lock().clone();
     for k in kids {
         let mp = k.parent.lock().as_ref().map(|(_, d)| d.clone());
@@ -1140,6 +1319,7 @@ fn bind_children(src: &PathRef, newm: &Arc<Mount>) {
         }
         if inside {
             let c = Mount::new(k.root.clone(), k.flags(), &k.source, &k.fstype, &k.options);
+            c.locked.store(k.locked.load(Relaxed), Relaxed);
             newm.attach(&mp, &c);
             bind_children(&PathRef { mnt: k.clone(), d: k.root.clone() }, &c);
         }
@@ -1147,21 +1327,107 @@ fn bind_children(src: &PathRef, newm: &Arc<Mount>) {
 }
 
 pub fn umount2(target: usize, flags: u32) -> Result<usize> {
-    if !cred().capable(21) {
-        return Err(EPERM);
-    }
-    let target = user_path(target)?;
-    let p = lookup_at(AT_FDCWD, &target, flags & 8 == 0, false)?;
-    if !Arc::ptr_eq(&p.d, &p.mnt.root) || p.mnt.parent.lock().is_none() {
+    const MNT_FORCE: u32 = 1;
+    const MNT_DETACH: u32 = 2;
+    const MNT_EXPIRE: u32 = 4;
+    const UMOUNT_NOFOLLOW: u32 = 8;
+    if flags & !(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) != 0 {
         return Err(EINVAL);
     }
-    if flags & 2 == 0 && !p.mnt.children.lock().is_empty() {
+    let ns = mnt_ns_admin()?;
+    let target = user_path(target)?;
+    // the topmost mount at the path (LOOKUP_MOUNTPOINT): "." after pivot_root(".", ".") is the old root
+    let p = lookup_at(AT_FDCWD, &target, flags & UMOUNT_NOFOLLOW == 0, false)?.cross_down();
+    if !Arc::ptr_eq(&p.d, &p.mnt.root) || p.mnt.parent.lock().is_none() || !in_ns(&p.mnt, &ns) {
+        return Err(EINVAL);
+    }
+    if p.mnt.locked.load(core::sync::atomic::Ordering::Relaxed) & path::MNT_LOCKED != 0 {
+        return Err(EINVAL);
+    }
+    if flags & MNT_DETACH == 0 && !p.mnt.children.lock().is_empty() {
         return Err(EBUSY);
     }
     p.mnt.detach();
     // the file system is no longer mounted anywhere: flush it and mark it clean
     if !crate::fs::is_mounted(&p.d.fs) {
         p.d.fs.unmount()?;
+    }
+    Ok(0)
+}
+
+/// pivot_root(2): the mount at `new_root` becomes the root of the caller's mount namespace and the
+/// old root moves to `put_old`; processes whose root or working directory was the old root follow.
+pub fn pivot_root(new_root: usize, put_old: usize) -> Result<usize> {
+    let ns = mnt_ns_admin()?;
+    let new_path = user_path(new_root)?;
+    let old_path = user_path(put_old)?;
+    let new = lookup_at(AT_FDCWD, &new_path, true, false)?;
+    let old = lookup_at(AT_FDCWD, &old_path, true, false)?;
+    if !is_dir(&new.inode()?) || !is_dir(&old.inode()?) {
+        return Err(ENOTDIR);
+    }
+    let root = current_thread().fs.lock().root.clone();
+    // the current root must be the root of its mount; new_root a mount point, another mount
+    if !Arc::ptr_eq(&root.d, &root.mnt.root) || !Arc::ptr_eq(&new.d, &new.mnt.root) {
+        return Err(EINVAL);
+    }
+    if Arc::ptr_eq(&new.mnt, &root.mnt) {
+        return Err(EBUSY);
+    }
+    if !in_ns(&new.mnt, &ns) || !in_ns(&root.mnt, &ns) || !in_ns(&old.mnt, &ns) {
+        return Err(EINVAL);
+    }
+    if new.mnt.locked.load(core::sync::atomic::Ordering::Relaxed) & path::MNT_LOCKED != 0 {
+        return Err(EINVAL);
+    }
+    // new_root below the current root; put_old at or below new_root
+    let below = |x: &PathRef, top: &PathRef| -> bool {
+        let mut p = x.clone();
+        for _ in 0..4096 {
+            if p.same(top) {
+                return true;
+            }
+            let up = p.up(&root);
+            if up.same(&p) {
+                return false;
+            }
+            p = up;
+        }
+        false
+    };
+    if !below(&new, &root) || !below(&old, &new) {
+        return Err(EINVAL);
+    }
+    let r = root.mnt.clone();
+    let n = new.mnt.clone();
+    let r_parent = r.parent.lock().clone();
+    // new_root's mount leaves its place; the old root goes to put_old; new_root takes the old
+    // root's place
+    n.detach();
+    if r_parent.is_some() {
+        r.detach();
+    }
+    old.mnt.attach(&old.d, &r);
+    match r_parent {
+        Some((pm, at)) => pm.attach(&at, &n),
+        None => {
+            *n.parent.lock() = None;
+            *ns.root.lock() = n.clone();
+        }
+    }
+    // chroot_fs_refs: everyone at the old root moves to the new one
+    let new_root_ref = PathRef { mnt: n.clone(), d: n.root.clone() };
+    let tasks: Vec<_> = crate::task::TASKS.lock().values().filter_map(|w| w.upgrade()).collect();
+    for t in tasks {
+        if let Some(th) = crate::task::thread_of(&t) {
+            let mut f = th.fs.lock();
+            if f.root.same(&root) {
+                f.root = new_root_ref.clone();
+            }
+            if f.cwd.same(&root) {
+                f.cwd = new_root_ref.clone();
+            }
+        }
     }
     Ok(0)
 }

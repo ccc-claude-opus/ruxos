@@ -108,7 +108,7 @@ pub fn pidfd_open(pid: i32, flags: u32) -> Result<usize> {
     if pid <= 0 || flags & !O_NONBLOCK != 0 {
         return Err(EINVAL);
     }
-    let p = crate::task::proc_by_pid(pid as u32).ok_or(ESRCH)?;
+    let p = crate::task::proc_by_vpid(pid as u32).ok_or(ESRCH)?;
     install(PidFd::new(p), flags | O_CLOEXEC)
 }
 

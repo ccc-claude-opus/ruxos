@@ -9,7 +9,10 @@ pub struct Netlink {
     proto: i32,
     rx: SpinLock<VecDeque<Vec<u8>>>,
     pq: PollQueue,
+    /// the port id: the creator's pid in its PID namespace (autobind)
     pid: u32,
+    /// the network namespace it talks about
+    ns: Arc<crate::ns::NetNs>,
 }
 
 pub fn socket(ty: u32, proto: i32) -> Result<Arc<dyn Socket>> {
@@ -19,7 +22,8 @@ pub fn socket(ty: u32, proto: i32) -> Result<Arc<dyn Socket>> {
     if proto != 0 {
         return Err(EPROTONOSUPPORT); // only NETLINK_ROUTE
     }
-    Ok(Arc::new(Netlink { proto, rx: SpinLock::new(VecDeque::new()), pq: PollQueue::new(), pid: crate::task::current_proc().pid }))
+    let p = crate::task::current_proc();
+    Ok(Arc::new(Netlink { proto, rx: SpinLock::new(VecDeque::new()), pq: PollQueue::new(), pid: p.pid_ns.local_of(p.pid), ns: crate::ns::cur_net() }))
 }
 
 const NLMSG_ERROR: u16 = 2;
@@ -56,9 +60,16 @@ fn msg(ty: u16, flags: u16, seq: u32, pid: u32, body: &[u8]) -> Vec<u8> {
     m
 }
 
-/// (index, name, mac, mtu, flags, address/prefix)
-fn links() -> Vec<(i32, &'static [u8], [u8; 6], u32, u32, Option<([u8; 4], u8)>)> {
-    let mut v = alloc::vec![(1, &b"lo"[..], [0u8; 6], 65536u32, 0x49u32, Some(([127, 0, 0, 1], 8u8)))];
+/// (index, name, mac, mtu, flags, address/prefix) of the interfaces of namespace `ns`: the initial
+/// one has lo and eth0, a new one only lo (down and without an address until set up).
+fn links(ns: &crate::ns::NetNs) -> Vec<(i32, &'static [u8], [u8; 6], u32, u32, Option<([u8; 4], u8)>)> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let lo_flags = if ns.lo_up.load(Relaxed) { 0x49u32 } else { 0x8 };
+    let lo_addr = if ns.lo_addr.load(Relaxed) { Some(([127, 0, 0, 1], 8u8)) } else { None };
+    let mut v = alloc::vec![(1, &b"lo"[..], [0u8; 6], 65536u32, lo_flags, lo_addr)];
+    if !ns.is_init {
+        return v;
+    }
     if let Some(n) = crate::drivers::virtio_net::NIC.get() {
         let a = super::inet::STACK.lock().as_ref().and_then(|s| s.addr).map(|(a, p)| (a.octets(), p));
         v.push((2, &b"eth0"[..], n.mac, 1500, 0x11043, a));
@@ -67,6 +78,47 @@ fn links() -> Vec<(i32, &'static [u8], [u8; 6], u32, u32, Option<([u8; 4], u8)>)
 }
 
 impl Netlink {
+    /// RTM_NEWADDR / RTM_NEWLINK and friends. In the initial namespace they are accepted (the
+    /// address comes from DHCP-like setup); in a new one they configure its lo.
+    fn change(&self, ty: u16, body: &[u8]) -> Result<()> {
+        use core::sync::atomic::Ordering::Relaxed;
+        if !crate::task::current_proc().cred().ns_capable(&self.ns.user_ns, 12) {
+            return Err(EPERM); // CAP_NET_ADMIN over the namespace
+        }
+        if self.ns.is_init {
+            return Ok(());
+        }
+        match ty {
+            RTM_NEWADDR => {
+                // struct ifaddrmsg { family u8, prefixlen u8, flags u8, scope u8, index u32 }
+                let idx = body.get(4..8).map(|b| u32::from_le_bytes(b.try_into().unwrap())).ok_or(EINVAL)?;
+                if idx != 1 {
+                    return Err(ENODEV);
+                }
+                self.ns.lo_addr.store(true, Relaxed);
+                Ok(())
+            }
+            RTM_NEWLINK => {
+                // struct ifinfomsg { family u8, pad u8, type u16, index i32, flags u32, change u32 }
+                let idx = body.get(4..8).map(|b| i32::from_le_bytes(b.try_into().unwrap())).ok_or(EINVAL)?;
+                let fl = body.get(8..12).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+                let change = body.get(12..16).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+                if idx != 1 {
+                    return Err(ENODEV);
+                }
+                if change == 0 || change & 1 != 0 {
+                    self.ns.lo_up.store(fl & 1 != 0, Relaxed);
+                    // lo gets its address when it comes up
+                    if fl & 1 != 0 {
+                        self.ns.lo_addr.store(true, Relaxed);
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn reply(&self, req: &[u8]) {
         let mut off = 0;
         let mut out: Vec<Vec<u8>> = Vec::new();
@@ -81,7 +133,7 @@ impl Netlink {
             let pid = self.pid;
             match ty {
                 RTM_GETLINK => {
-                    for (idx, name, mac, mtu, fl, _) in links() {
+                    for (idx, name, mac, mtu, fl, _) in links(&self.ns) {
                         // struct ifinfomsg { family u8, pad, type u16, index i32, flags u32, change u32 }
                         let mut b = Vec::new();
                         b.push(0);
@@ -102,7 +154,7 @@ impl Netlink {
                     out.push(msg(NLMSG_DONE, NLM_F_MULTI, seq, pid, &0i32.to_le_bytes()));
                 }
                 RTM_GETADDR => {
-                    for (idx, name, _, _, _, a) in links() {
+                    for (idx, name, _, _, _, a) in links(&self.ns) {
                         let Some((ip, pfx)) = a else { continue };
                         // struct ifaddrmsg { family u8, prefixlen u8, flags u8, scope u8, index u32 }
                         let mut b = alloc::vec![2u8, pfx, 0x80, if idx == 1 { 254 } else { 0 }];
@@ -122,7 +174,7 @@ impl Netlink {
                     out.push(msg(NLMSG_DONE, NLM_F_MULTI, seq, pid, &0i32.to_le_bytes()));
                 }
                 RTM_GETROUTE => {
-                    let gw = super::inet::STACK.lock().as_ref().and_then(|s| s.gateway).map(|g| g.octets());
+                    let gw = if self.ns.is_init { super::inet::STACK.lock().as_ref().and_then(|s| s.gateway).map(|g| g.octets()) } else { None };
                     if let Some(gw) = gw {
                         // struct rtmsg { family, dst_len, src_len, tos, table, protocol, scope, type, flags u32 }
                         let mut b = alloc::vec![2u8, 0, 0, 0, 254, 4, 0, 1];
@@ -135,9 +187,15 @@ impl Netlink {
                     out.push(msg(NLMSG_DONE, NLM_F_MULTI, seq, pid, &0i32.to_le_bytes()));
                 }
                 _ => {
-                    // changes (new address, link up...) are accepted; acknowledge when asked
-                    if flags & 4 != 0 || ty >= 16 {
-                        let mut b = 0i32.to_le_bytes().to_vec();
+                    // changes: an error message on failure, an acknowledgement on success when
+                    // asked for (NLM_F_ACK)
+                    let r = self.change(ty, &req[off + 16..off + len]);
+                    if r.is_err() || flags & 4 != 0 {
+                        let code: i32 = match r {
+                            Ok(()) => 0,
+                            Err(e) => -e.0,
+                        };
+                        let mut b = code.to_le_bytes().to_vec();
                         b.extend_from_slice(&req[off..off + 16]);
                         out.push(msg(NLMSG_ERROR, 0, seq, pid, &b));
                     }

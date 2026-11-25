@@ -47,8 +47,8 @@ pub fn wait4(pid: i32, status: usize, options: u32, rusage: usize) -> Result<usi
     let who = match pid {
         -1 => WaitWho::Any,
         0 => WaitWho::Pgid(current_proc().pgid.load(Ordering::Relaxed)),
-        p if p < 0 => WaitWho::Pgid((-p) as u32),
-        p => WaitWho::Pid(p as u32),
+        p if p < 0 => WaitWho::Pgid(crate::task::gpid((-p) as u32).unwrap_or(u32::MAX)),
+        p => WaitWho::Pid(crate::task::gpid(p as u32).unwrap_or(u32::MAX)),
     };
     match crate::task::wait(who, (options & (WNOHANG | WUNTRACED | WCONTINUED)) | WEXITED)? {
         None => Ok(0),
@@ -67,8 +67,8 @@ pub fn wait4(pid: i32, status: usize, options: u32, rusage: usize) -> Result<usi
 pub fn waitid(idtype: u32, id: i32, info: usize, options: u32, _ru: usize) -> Result<usize> {
     let who = match idtype {
         0 => WaitWho::Any,
-        1 => WaitWho::Pid(id as u32),
-        2 => WaitWho::Pgid(if id == 0 { current_proc().pgid.load(Ordering::Relaxed) } else { id as u32 }),
+        1 => WaitWho::Pid(crate::task::gpid(id as u32).unwrap_or(u32::MAX)),
+        2 => WaitWho::Pgid(if id == 0 { current_proc().pgid.load(Ordering::Relaxed) } else { crate::task::gpid(id as u32).unwrap_or(u32::MAX) }),
         3 => {
             // P_PIDFD
             let f = super::fs::file(id)?;
@@ -104,7 +104,7 @@ pub const WSTOPPED: u32 = 2;
 
 pub fn set_tid_address(p: usize) -> Result<usize> {
     own().clear_child_tid = p;
-    Ok(sched::current().tid as usize)
+    Ok(crate::task::vpid(sched::current().tid) as usize)
 }
 
 pub fn set_robust_list(head: usize, len: usize) -> Result<usize> {
@@ -119,7 +119,7 @@ pub fn get_robust_list(tid: i32, head_ptr: usize, len_ptr: usize) -> Result<usiz
     let head = if tid == 0 {
         own().robust_list
     } else {
-        let t = task_by_tid(tid as u32).ok_or(ESRCH)?;
+        let t = crate::task::task_by_vtid(tid as u32).ok_or(ESRCH)?;
         unsafe { (*thread_of(&t).ok_or(ESRCH)?.own.get()).robust_list }
     };
     write_user(head_ptr, &head)?;
@@ -377,7 +377,7 @@ pub fn kill(pid: i32, sig: u32) -> Result<usize> {
     let me = current_proc().clone();
     match pid {
         p if p > 0 => {
-            let t = proc_by_pid(p as u32).ok_or(ESRCH)?;
+            let t = crate::task::proc_by_vpid(p as u32).ok_or(ESRCH)?;
             if !may_signal(&t, sig) {
                 return Err(EPERM);
             }
@@ -393,9 +393,12 @@ pub fn kill(pid: i32, sig: u32) -> Result<usize> {
             kill_pgrp(me.pgid.load(Ordering::Relaxed), info)
         }
         -1 => {
-            let all: Vec<Arc<Process>> = PROCS.lock().values().filter_map(|w| w.upgrade()).collect();
+            // every process visible in our PID namespace but its init and ourselves
+            let all: Vec<Arc<Process>> = PROCS.lock().values().filter_map(|w| w.upgrade()).filter(|p| me.pid_ns.contains(&p.pid_ns)).collect();
+            let reaper = me.pid_ns.reaper.lock().upgrade();
             for p in all {
-                if p.pid != 1 && !Arc::ptr_eq(&p, &me) && p.pid != INIT.get().map_or(0, |i| i.pid) && may_signal(&p, sig) && sig != 0 {
+                let is_init = reaper.as_ref().is_some_and(|r| Arc::ptr_eq(r, &p)) || p.pid == INIT.get().map_or(0, |i| i.pid);
+                if !is_init && !Arc::ptr_eq(&p, &me) && may_signal(&p, sig) && sig != 0 {
                     signal::send_process(&p, info);
                 }
             }
@@ -405,7 +408,7 @@ pub fn kill(pid: i32, sig: u32) -> Result<usize> {
             if sig == 0 {
                 return Ok(0);
             }
-            kill_pgrp((-p) as u32, info)
+            kill_pgrp(crate::task::gpid((-p) as u32).ok_or(ESRCH)?, info)
         }
     }
 }
@@ -414,9 +417,9 @@ pub fn tgkill(tgid: i32, tid: i32, sig: u32) -> Result<usize> {
     if sig > signal::NSIG || tid <= 0 {
         return Err(EINVAL);
     }
-    let t = task_by_tid(tid as u32).ok_or(ESRCH)?;
+    let t = crate::task::task_by_vtid(tid as u32).ok_or(ESRCH)?;
     let th = thread_of(&t).ok_or(ESRCH)?;
-    if tgid > 0 && th.proc.pid != tgid as u32 {
+    if tgid > 0 && Some(th.proc.pid) != crate::task::gpid(tgid as u32) {
         return Err(ESRCH);
     }
     if sig != 0 {
@@ -433,7 +436,7 @@ pub fn rt_sigqueueinfo(pid: i32, sig: u32, info: usize) -> Result<usize> {
     let b: [u8; 128] = read_user(info)?;
     let mut i = SigInfo::from_user_bytes(&b);
     i.signo = sig;
-    let p = proc_by_pid(pid as u32).ok_or(ESRCH)?;
+    let p = crate::task::proc_by_vpid(pid as u32).ok_or(ESRCH)?;
     signal::send_process(&p, i);
     Ok(0)
 }
@@ -442,8 +445,8 @@ pub fn rt_tgsigqueueinfo(tgid: i32, tid: i32, sig: u32, info: usize) -> Result<u
     let b: [u8; 128] = read_user(info)?;
     let mut i = SigInfo::from_user_bytes(&b);
     i.signo = sig;
-    let t = task_by_tid(tid as u32).ok_or(ESRCH)?;
-    if thread_of(&t).map(|x| x.proc.pid) != Some(tgid as u32) {
+    let t = crate::task::task_by_vtid(tid as u32).ok_or(ESRCH)?;
+    if thread_of(&t).map(|x| x.proc.pid) != crate::task::gpid(tgid as u32) {
         return Err(ESRCH);
     }
     signal::send_thread(&t, i);
@@ -453,7 +456,7 @@ pub fn rt_tgsigqueueinfo(tgid: i32, tid: i32, sig: u32, info: usize) -> Result<u
 // ---- process groups and sessions
 
 pub fn getppid() -> Result<usize> {
-    Ok(current_proc().parent().map_or(0, |p| p.pid as usize))
+    Ok(current_proc().parent().map_or(0, |p| crate::task::vpid(p.pid) as usize))
 }
 
 pub fn setpgid(pid: i32, pgid: i32) -> Result<usize> {
@@ -461,26 +464,26 @@ pub fn setpgid(pid: i32, pgid: i32) -> Result<usize> {
         return Err(EINVAL);
     }
     let me = current_proc().clone();
-    let target = if pid == 0 { me.clone() } else { proc_by_pid(pid as u32).ok_or(ESRCH)? };
+    let target = if pid == 0 { me.clone() } else { crate::task::proc_by_vpid(pid as u32).ok_or(ESRCH)? };
     if !Arc::ptr_eq(&target, &me) && !target.parent().is_some_and(|p| Arc::ptr_eq(&p, &me)) {
         return Err(ESRCH);
     }
     if target.sid.load(Ordering::Relaxed) == target.pid {
         return Err(EPERM);
     }
-    let pg = if pgid == 0 { target.pid } else { pgid as u32 };
+    let pg = if pgid == 0 { target.pid } else { crate::task::gpid(pgid as u32).ok_or(EPERM)? };
     target.pgid.store(pg, Ordering::Relaxed);
     Ok(0)
 }
 
 pub fn getpgid(pid: i32) -> Result<usize> {
-    let p = if pid == 0 { current_proc().clone() } else { proc_by_pid(pid as u32).ok_or(ESRCH)? };
-    Ok(p.pgid.load(Ordering::Relaxed) as usize)
+    let p = if pid == 0 { current_proc().clone() } else { crate::task::proc_by_vpid(pid as u32).ok_or(ESRCH)? };
+    Ok(crate::task::vpid(p.pgid.load(Ordering::Relaxed)) as usize)
 }
 
 pub fn getsid(pid: i32) -> Result<usize> {
-    let p = if pid == 0 { current_proc().clone() } else { proc_by_pid(pid as u32).ok_or(ESRCH)? };
-    Ok(p.sid.load(Ordering::Relaxed) as usize)
+    let p = if pid == 0 { current_proc().clone() } else { crate::task::proc_by_vpid(pid as u32).ok_or(ESRCH)? };
+    Ok(crate::task::vpid(p.sid.load(Ordering::Relaxed)) as usize)
 }
 
 pub fn setsid() -> Result<usize> {
@@ -493,32 +496,83 @@ pub fn setsid() -> Result<usize> {
     me.sid.store(pid, Ordering::Relaxed);
     me.pgid.store(pid, Ordering::Relaxed);
     *me.ctty.lock() = None;
-    Ok(pid as usize)
+    Ok(crate::task::vpid(pid) as usize)
 }
 
-// ---- credentials
+// ---- credentials (ids are translated through the caller's user namespace; capabilities count in
+// that namespace)
+
+/// The capabilities of the file system ids (CAP_FS_MASK): CHOWN, DAC_OVERRIDE, DAC_READ_SEARCH,
+/// FOWNER, FSETID, LINUX_IMMUTABLE, MKNOD, MAC_OVERRIDE.
+const CAP_FS_MASK: u64 = 0x1f | (1 << 9) | (1 << 27) | (1 << 32);
 
 fn set_cred(f: impl FnOnce(&mut Cred) -> Result<()>) -> Result<usize> {
     let p = current_proc();
     let mut c = p.cred.lock();
     let mut n = c.clone();
     f(&mut n)?;
-    // dropping all root ids clears the capabilities (no keepcaps)
-    if c.euid == 0 && n.euid != 0 && n.uid != 0 && n.suid != 0 {
+    // capabilities follow the uids (capabilities(7), "Effect of user ID changes on capabilities")
+    let root = c.user_ns.make_kuid(0);
+    let is = |u: u32| Some(u) == root;
+    if (is(c.uid) || is(c.euid) || is(c.suid)) && !is(n.uid) && !is(n.euid) && !is(n.suid) {
+        if !n.keepcaps {
+            n.cap_perm = 0;
+            n.cap_eff = 0;
+        }
+        n.cap_amb = 0;
+    }
+    if is(c.euid) && !is(n.euid) {
         n.cap_eff = 0;
-        n.cap_perm = 0;
-    } else if c.euid == 0 && n.euid != 0 {
-        n.cap_eff = 0;
-    } else if c.euid != 0 && n.euid == 0 {
+    }
+    if !is(c.euid) && is(n.euid) {
         n.cap_eff = n.cap_perm;
+    }
+    if is(c.fsuid) && !is(n.fsuid) {
+        n.cap_eff &= !CAP_FS_MASK;
+    }
+    if !is(c.fsuid) && is(n.fsuid) {
+        n.cap_eff |= n.cap_perm & CAP_FS_MASK;
+    }
+    // a process whose ids change is no longer dumpable (its /proc files become root's), as Linux
+    if c.euid != n.euid || c.egid != n.egid || c.fsuid != n.fsuid || c.fsgid != n.fsgid {
+        p.dumpable.store(0, Ordering::Relaxed);
     }
     *c = n;
     Ok(0)
 }
 
+/// A uid argument (-1 = unchanged) as a kernel uid.
+fn kuid(c: &Cred, u: u32) -> Result<u32> {
+    if u == u32::MAX { Ok(u) } else { c.user_ns.make_kuid(u).ok_or(EINVAL) }
+}
+fn kgid(c: &Cred, g: u32) -> Result<u32> {
+    if g == u32::MAX { Ok(g) } else { c.user_ns.make_kgid(g).ok_or(EINVAL) }
+}
+
+pub fn getuid() -> Result<usize> {
+    let c = current_proc().cred();
+    Ok(c.user_ns.from_kuid(c.uid) as usize)
+}
+pub fn geteuid() -> Result<usize> {
+    let c = current_proc().cred();
+    Ok(c.user_ns.from_kuid(c.euid) as usize)
+}
+pub fn getgid() -> Result<usize> {
+    let c = current_proc().cred();
+    Ok(c.user_ns.from_kgid(c.gid) as usize)
+}
+pub fn getegid() -> Result<usize> {
+    let c = current_proc().cred();
+    Ok(c.user_ns.from_kgid(c.egid) as usize)
+}
+
 pub fn setuid(uid: u32) -> Result<usize> {
     set_cred(|c| {
-        if c.capable(7) {
+        let uid = kuid(c, uid)?;
+        if uid == u32::MAX {
+            return Err(EINVAL);
+        }
+        if c.own_capable(7) {
             c.uid = uid;
             c.euid = uid;
             c.suid = uid;
@@ -534,7 +588,11 @@ pub fn setuid(uid: u32) -> Result<usize> {
 
 pub fn setgid(gid: u32) -> Result<usize> {
     set_cred(|c| {
-        if c.capable(6) {
+        let gid = kgid(c, gid)?;
+        if gid == u32::MAX {
+            return Err(EINVAL);
+        }
+        if c.own_capable(6) {
             c.gid = gid;
             c.egid = gid;
             c.sgid = gid;
@@ -554,8 +612,9 @@ fn pick(cur: u32, new: u32) -> u32 {
 
 pub fn setresuid(r: u32, e: u32, s: u32) -> Result<usize> {
     set_cred(|c| {
+        let (r, e, s) = (kuid(c, r)?, kuid(c, e)?, kuid(c, s)?);
         let ok = |v: u32| v == u32::MAX || v == c.uid || v == c.euid || v == c.suid;
-        if !c.capable(7) && !(ok(r) && ok(e) && ok(s)) {
+        if !c.own_capable(7) && !(ok(r) && ok(e) && ok(s)) {
             return Err(EPERM);
         }
         c.uid = pick(c.uid, r);
@@ -568,8 +627,9 @@ pub fn setresuid(r: u32, e: u32, s: u32) -> Result<usize> {
 
 pub fn setresgid(r: u32, e: u32, s: u32) -> Result<usize> {
     set_cred(|c| {
+        let (r, e, s) = (kgid(c, r)?, kgid(c, e)?, kgid(c, s)?);
         let ok = |v: u32| v == u32::MAX || v == c.gid || v == c.egid || v == c.sgid;
-        if !c.capable(6) && !(ok(r) && ok(e) && ok(s)) {
+        if !c.own_capable(6) && !(ok(r) && ok(e) && ok(s)) {
             return Err(EPERM);
         }
         c.gid = pick(c.gid, r);
@@ -580,52 +640,102 @@ pub fn setresgid(r: u32, e: u32, s: u32) -> Result<usize> {
     })
 }
 
+/// setreuid(2): the saved uid becomes the new effective uid when the real uid is set, or the
+/// effective uid is set to something other than the old real uid.
 pub fn setreuid(r: u32, e: u32) -> Result<usize> {
-    setresuid(r, e, if r != u32::MAX || e != u32::MAX { pick(current_proc().cred.lock().euid, e) } else { u32::MAX })
+    set_cred(|c| {
+        let (r, e) = (kuid(c, r)?, kuid(c, e)?);
+        let cap = c.own_capable(7);
+        if r != u32::MAX && !cap && r != c.uid && r != c.euid {
+            return Err(EPERM);
+        }
+        if e != u32::MAX && !cap && e != c.uid && e != c.euid && e != c.suid {
+            return Err(EPERM);
+        }
+        let old_r = c.uid;
+        c.uid = pick(c.uid, r);
+        c.euid = pick(c.euid, e);
+        if r != u32::MAX || (e != u32::MAX && e != old_r) {
+            c.suid = c.euid;
+        }
+        c.fsuid = c.euid;
+        Ok(())
+    })
 }
 
 pub fn setregid(r: u32, e: u32) -> Result<usize> {
-    setresgid(r, e, u32::MAX)
+    set_cred(|c| {
+        let (r, e) = (kgid(c, r)?, kgid(c, e)?);
+        let cap = c.own_capable(6);
+        if r != u32::MAX && !cap && r != c.gid && r != c.egid {
+            return Err(EPERM);
+        }
+        if e != u32::MAX && !cap && e != c.gid && e != c.egid && e != c.sgid {
+            return Err(EPERM);
+        }
+        let old_r = c.gid;
+        c.gid = pick(c.gid, r);
+        c.egid = pick(c.egid, e);
+        if r != u32::MAX || (e != u32::MAX && e != old_r) {
+            c.sgid = c.egid;
+        }
+        c.fsgid = c.egid;
+        Ok(())
+    })
 }
 
 pub fn getresuid(r: usize, e: usize, s: usize) -> Result<usize> {
     let c = current_proc().cred();
-    write_user(r, &c.uid)?;
-    write_user(e, &c.euid)?;
-    write_user(s, &c.suid)?;
+    let n = &c.user_ns;
+    write_user(r, &n.from_kuid(c.uid))?;
+    write_user(e, &n.from_kuid(c.euid))?;
+    write_user(s, &n.from_kuid(c.suid))?;
     Ok(0)
 }
 
 pub fn getresgid(r: usize, e: usize, s: usize) -> Result<usize> {
     let c = current_proc().cred();
-    write_user(r, &c.gid)?;
-    write_user(e, &c.egid)?;
-    write_user(s, &c.sgid)?;
+    let n = &c.user_ns;
+    write_user(r, &n.from_kgid(c.gid))?;
+    write_user(e, &n.from_kgid(c.egid))?;
+    write_user(s, &n.from_kgid(c.sgid))?;
     Ok(0)
 }
 
+/// setfsuid(2) returns the old fsuid whether or not the change was allowed.
 pub fn setfsuid(u: u32) -> Result<usize> {
-    let p = current_proc();
-    let mut c = p.cred.lock();
-    let old = c.fsuid;
-    if u != u32::MAX && (c.capable(7) || u == c.uid || u == c.euid || u == c.suid) {
-        c.fsuid = u;
-    }
+    let old = {
+        let c = current_proc().cred();
+        c.user_ns.from_kuid(c.fsuid)
+    };
+    let _ = set_cred(|c| {
+        let Ok(u) = kuid(c, u) else { return Ok(()) };
+        if u != u32::MAX && (c.own_capable(7) || u == c.uid || u == c.euid || u == c.suid || u == c.fsuid) {
+            c.fsuid = u;
+        }
+        Ok(())
+    });
     Ok(old as usize)
 }
 
 pub fn setfsgid(g: u32) -> Result<usize> {
-    let p = current_proc();
-    let mut c = p.cred.lock();
-    let old = c.fsgid;
-    if g != u32::MAX && (c.capable(6) || g == c.gid || g == c.egid || g == c.sgid) {
-        c.fsgid = g;
-    }
+    let old = {
+        let c = current_proc().cred();
+        c.user_ns.from_kgid(c.fsgid)
+    };
+    let _ = set_cred(|c| {
+        let Ok(g) = kgid(c, g) else { return Ok(()) };
+        if g != u32::MAX && (c.own_capable(6) || g == c.gid || g == c.egid || g == c.sgid || g == c.fsgid) {
+            c.fsgid = g;
+        }
+        Ok(())
+    });
     Ok(old as usize)
 }
 
 pub fn getgroups(size: usize, list: usize) -> Result<usize> {
-    let g = current_proc().cred().groups;
+    let c = current_proc().cred();
+    let g = &c.groups;
     if size == 0 {
         return Ok(g.len());
     }
@@ -633,7 +743,7 @@ pub fn getgroups(size: usize, list: usize) -> Result<usize> {
         return Err(EINVAL);
     }
     for (i, x) in g.iter().enumerate() {
-        write_user(list + 4 * i, x)?;
+        write_user(list + 4 * i, &c.user_ns.from_kgid(*x))?;
     }
     Ok(g.len())
 }
@@ -648,54 +758,95 @@ pub fn setgroups(size: usize, list: usize) -> Result<usize> {
     }
     let p = current_proc();
     let mut c = p.cred.lock();
-    if !c.capable(6) {
+    // CAP_SETGID in the own namespace, unless the namespace's setgroups is "deny"
+    if !c.own_capable(6) || !c.user_ns.setgroups_allowed.load(Ordering::Relaxed) || c.user_ns.gid_map.lock().is_none() {
         return Err(EPERM);
     }
-    c.groups = g;
+    let mut k = Vec::with_capacity(g.len());
+    for x in g {
+        k.push(c.user_ns.make_kgid(x).ok_or(EINVAL)?);
+    }
+    k.sort_unstable();
+    k.dedup();
+    c.groups = k;
     Ok(0)
 }
 
+const CAP_V1: u32 = 0x1998_0330;
+const CAP_V2: u32 = 0x2007_1026;
+const CAP_V3: u32 = 0x2008_0522;
+
 pub fn capget(hdr: usize, data: usize) -> Result<usize> {
     let h: [u32; 2] = read_user(hdr)?;
-    let c = current_proc().cred();
-    if h[0] != 0x2008_0522 && h[0] != 0x2007_1026 {
-        write_user(hdr, &[0x2008_0522u32, h[1]])?;
+    if h[0] != CAP_V3 && h[0] != CAP_V2 && h[0] != CAP_V1 {
+        write_user(hdr, &[CAP_V3, h[1]])?;
         return if data == 0 { Ok(0) } else { Err(EINVAL) };
     }
+    let c = if h[1] == 0 {
+        current_proc().cred()
+    } else {
+        let g = current_proc().pid_ns.global_of(h[1]).ok_or(ESRCH)?;
+        crate::task::proc_by_pid(g).ok_or(ESRCH)?.cred()
+    };
     if data != 0 {
-        let v: [u32; 6] = [c.cap_eff as u32, c.cap_perm as u32, c.cap_inh as u32, (c.cap_eff >> 32) as u32, (c.cap_perm >> 32) as u32, (c.cap_inh >> 32) as u32];
-        write_user(data, &v)?;
+        if h[0] == CAP_V1 {
+            write_user(data, &[c.cap_eff as u32, c.cap_perm as u32, c.cap_inh as u32])?;
+        } else {
+            let v: [u32; 6] = [c.cap_eff as u32, c.cap_perm as u32, c.cap_inh as u32, (c.cap_eff >> 32) as u32, (c.cap_perm >> 32) as u32, (c.cap_inh >> 32) as u32];
+            write_user(data, &v)?;
+        }
     }
     Ok(0)
 }
 
 pub fn capset(hdr: usize, data: usize) -> Result<usize> {
     let h: [u32; 2] = read_user(hdr)?;
-    if h[1] != 0 && h[1] != current_proc().pid {
-        return Err(EPERM);
+    if h[0] != CAP_V3 && h[0] != CAP_V2 && h[0] != CAP_V1 {
+        write_user(hdr, &[CAP_V3, h[1]])?;
+        return Err(EINVAL);
     }
-    let v: [u32; 6] = read_user(data)?;
-    let eff = v[0] as u64 | ((v[3] as u64) << 32);
-    let perm = v[1] as u64 | ((v[4] as u64) << 32);
-    let inh = v[2] as u64 | ((v[5] as u64) << 32);
     let p = current_proc();
-    let mut c = p.cred.lock();
-    if perm & !c.cap_perm != 0 || eff & !perm != 0 {
+    if h[1] != 0 && Some(p.pid) != p.pid_ns.global_of(h[1]) {
         return Err(EPERM);
     }
-    c.cap_eff = eff;
-    c.cap_perm = perm;
-    c.cap_inh = inh;
+    let (eff, perm, inh) = if h[0] == CAP_V1 {
+        let v: [u32; 3] = read_user(data)?;
+        let c = p.cred();
+        // the upper 32 capabilities stay as they are
+        (v[0] as u64 | (c.cap_eff & !0xffff_ffff), v[1] as u64 | (c.cap_perm & !0xffff_ffff), v[2] as u64 | (c.cap_inh & !0xffff_ffff))
+    } else {
+        let v: [u32; 6] = read_user(data)?;
+        (v[0] as u64 | ((v[3] as u64) << 32), v[1] as u64 | ((v[4] as u64) << 32), v[2] as u64 | ((v[5] as u64) << 32))
+    };
+    let mut c = p.cred.lock();
+    // capset(2): inheritable within (inheritable | permitted), or the bounding set with CAP_SETPCAP;
+    // permitted can only shrink; effective within the new permitted
+    let inh_limit = if c.own_capable(8) { c.cap_inh | c.cap_bnd } else { c.cap_inh | c.cap_perm };
+    if inh & !inh_limit != 0 || inh & !(c.cap_inh | c.cap_bnd) != 0 || perm & !c.cap_perm != 0 || eff & !perm != 0 {
+        return Err(EPERM);
+    }
+    c.cap_eff = eff & crate::task::CAP_ALL;
+    c.cap_perm = perm & crate::task::CAP_ALL;
+    c.cap_inh = inh & crate::task::CAP_ALL;
+    // ambient capabilities must stay permitted and inheritable
+    c.cap_amb &= c.cap_perm & c.cap_inh;
     Ok(0)
 }
 
 // ---- system information
 
-pub static HOSTNAME: SpinLock<Vec<u8>> = SpinLock::new(Vec::new());
+/// The UTS namespace of the current process (the initial one for kernel threads).
+fn uts() -> Option<Arc<crate::ns::UtsNs>> {
+    crate::task::try_current_proc().map(|p| p.ns.lock().uts.clone())
+}
 
 pub fn hostname() -> Vec<u8> {
-    let h = HOSTNAME.lock();
-    if h.is_empty() { b"(none)".to_vec() } else { h.clone() }
+    let h = uts().map(|u| u.hostname.lock().clone()).unwrap_or_default();
+    if h.is_empty() { b"(none)".to_vec() } else { h }
+}
+
+pub fn domainname() -> Vec<u8> {
+    uts().map(|u| u.domainname.lock().clone()).unwrap_or_else(|| b"(none)".to_vec())
 }
 
 pub fn uname(buf: usize) -> Result<usize> {
@@ -709,21 +860,45 @@ pub fn uname(buf: usize) -> Result<usize> {
     put(&mut b, 2, crate::RELEASE.as_bytes());
     put(&mut b, 3, crate::VERSION.as_bytes());
     put(&mut b, 4, arch::PLATFORM);
-    put(&mut b, 5, b"(none)");
+    put(&mut b, 5, &domainname());
     copy_to_user(buf, &b)?;
     Ok(0)
+}
+
+/// Sets the host name of the caller's UTS namespace (CAP_SYS_ADMIN over that namespace).
+pub fn set_hostname(h: Vec<u8>) -> Result<()> {
+    if h.len() > 64 {
+        return Err(EINVAL);
+    }
+    let u = uts().ok_or(EPERM)?;
+    if !current_proc().cred().ns_capable(&u.user_ns, 21) {
+        return Err(EPERM);
+    }
+    *u.hostname.lock() = h;
+    Ok(())
 }
 
 pub fn sethostname(name: usize, len: usize) -> Result<usize> {
     if len > 64 {
         return Err(EINVAL);
     }
-    if !current_proc().cred().capable(21) {
-        return Err(EPERM);
+    let mut b = alloc::vec![0u8; len];
+    copy_from_user(&mut b, name)?;
+    set_hostname(b)?;
+    Ok(0)
+}
+
+pub fn setdomainname(name: usize, len: usize) -> Result<usize> {
+    if len > 64 {
+        return Err(EINVAL);
     }
     let mut b = alloc::vec![0u8; len];
     copy_from_user(&mut b, name)?;
-    *HOSTNAME.lock() = b;
+    let u = uts().ok_or(EPERM)?;
+    if !current_proc().cred().ns_capable(&u.user_ns, 21) {
+        return Err(EPERM);
+    }
+    *u.domainname.lock() = b;
     Ok(0)
 }
 
@@ -757,7 +932,7 @@ pub fn prlimit64(pid: i32, res: u32, new: usize, old: usize) -> Result<usize> {
     if res as usize >= 16 {
         return Err(EINVAL);
     }
-    let p = if pid == 0 { current_proc().clone() } else { proc_by_pid(pid as u32).ok_or(ESRCH)? };
+    let p = if pid == 0 { current_proc().clone() } else { crate::task::proc_by_vpid(pid as u32).ok_or(ESRCH)? };
     let mut r = p.rlimits.lock();
     let cur = r[res as usize];
     if new != 0 {
@@ -880,7 +1055,15 @@ pub fn prctl(op: u32, a2: usize, a3: usize, _a4: usize, _a5: usize) -> Result<us
             p.dumpable.store(a2 as u32, Ordering::Relaxed);
             Ok(0)
         }
-        7 | 8 => Ok(0), // PR_GET/SET_KEEPCAPS
+        7 => Ok(p.cred.lock().keepcaps as usize), // PR_GET_KEEPCAPS
+        8 => {
+            // PR_SET_KEEPCAPS
+            if a2 > 1 {
+                return Err(EINVAL);
+            }
+            p.cred.lock().keepcaps = a2 == 1;
+            Ok(0)
+        }
         15 => {
             let mut n = [0u8; 16];
             let s = crate::mm::vm::read_cstr(a2, 16).unwrap_or_default();
@@ -894,7 +1077,8 @@ pub fn prctl(op: u32, a2: usize, a3: usize, _a4: usize, _a5: usize) -> Result<us
             copy_to_user(a2, &n)?;
             Ok(0)
         }
-        21 => Ok(0), // PR_GET_SECCOMP
+        21 => Ok(crate::seccomp::mode() as usize), // PR_GET_SECCOMP
+        22 => crate::seccomp::set_mode(a2 as u32, 0, a3), // PR_SET_SECCOMP
         23 => {
             if a2 > 63 {
                 return Err(EINVAL);
@@ -906,7 +1090,7 @@ pub fn prctl(op: u32, a2: usize, a3: usize, _a4: usize, _a5: usize) -> Result<us
                 return Err(EINVAL);
             }
             let mut c = p.cred.lock();
-            if !c.capable(8) {
+            if !c.own_capable(8) {
                 return Err(EPERM);
             }
             c.cap_bnd &= !(1 << a2);
@@ -922,7 +1106,81 @@ pub fn prctl(op: u32, a2: usize, a3: usize, _a4: usize, _a5: usize) -> Result<us
         }
         39 => Ok(p.cred.lock().no_new_privs as usize),
         41 | 42 => Ok(0), // THP disable
-        47 => Ok(0),      // PR_CAP_AMBIENT
+        47 => {
+            // PR_CAP_AMBIENT: IS_SET 1, RAISE 2, LOWER 3, CLEAR_ALL 4
+            let mut c = p.cred.lock();
+            match a2 {
+                4 => {
+                    c.cap_amb = 0;
+                    Ok(0)
+                }
+                1..=3 if a3 > 40 => Err(EINVAL),
+                1 => Ok((c.cap_amb >> a3) as usize & 1),
+                2 => {
+                    let bit = 1u64 << a3;
+                    if c.cap_perm & bit == 0 || c.cap_inh & bit == 0 {
+                        return Err(EPERM);
+                    }
+                    c.cap_amb |= bit;
+                    Ok(0)
+                }
+                3 => {
+                    c.cap_amb &= !(1u64 << a3);
+                    Ok(0)
+                }
+                _ => Err(EINVAL),
+            }
+        }
         _ => Err(EINVAL),
     }
+}
+
+// ---- namespaces
+
+/// unshare(2): moves the caller into new namespaces, or gives it its own fs / fd table.
+pub fn unshare(mut flags: u64) -> Result<usize> {
+    use crate::task::*;
+    let known = CLONE_FILES | CLONE_FS | CLONE_SYSVSEM | CLONE_THREAD | CLONE_SIGHAND | CLONE_VM | crate::ns::CLONE_NEW_ANY;
+    if flags & !known != 0 {
+        return Err(EINVAL);
+    }
+    if flags & crate::ns::CLONE_NEWUSER != 0 {
+        flags |= CLONE_THREAD | CLONE_FS;
+    }
+    if flags & crate::ns::CLONE_NEWNS != 0 {
+        flags |= CLONE_FS;
+    }
+    let me = current_thread();
+    let p = me.proc.clone();
+    // sharing threads, handlers or memory can only be "undone" by a process with one thread
+    if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 && p.live_threads.load(Ordering::SeqCst) > 1 {
+        return Err(EINVAL);
+    }
+    if flags & CLONE_VM != 0 && Arc::strong_count(&me.mm) > 1 + p.live_threads.load(Ordering::SeqCst) {
+        return Err(EINVAL);
+    }
+    let task = sched::current_arc();
+    // SAFETY: the current thread's own state
+    let th = unsafe { task.user_mut().ok_or(EINVAL)? };
+    let mut fs = {
+        let f = th.fs.lock();
+        FsContext { root: f.root.clone(), cwd: f.cwd.clone(), umask: f.umask }
+    };
+    let mut cred = p.cred();
+    if flags & crate::ns::CLONE_NEWUSER != 0 {
+        cred = new_user_cred(&cred, &fs)?;
+    }
+    let old = p.ns.lock().clone();
+    let nsp = crate::ns::copy_namespaces(flags, &old, &cred, Some(&mut fs), &crate::cgroup::path_of(&p))?;
+    // commit
+    if flags & CLONE_FILES != 0 {
+        let copy = th.files.lock().clone();
+        th.files = Arc::new(SpinLock::new(copy));
+    }
+    if flags & CLONE_FS != 0 {
+        th.fs = Arc::new(SpinLock::new(fs));
+    }
+    *p.ns.lock() = nsp;
+    *p.cred.lock() = cred;
+    Ok(0)
 }

@@ -137,6 +137,15 @@ impl SigInfo {
 
     /// The 128-byte `siginfo_t` (union fields by signal and code).
     pub fn to_bytes(&self) -> [u8; 128] {
+        // pid and uid are kept as global ids; the receiver (the current process) sees them in its
+        // own PID and user namespaces
+        let (vpid, vuid) = match super::try_current_proc() {
+            Some(p) => {
+                let pid = if self.pid > 0 { p.pid_ns.local_of(self.pid as u32) as i32 } else { self.pid };
+                (pid, p.cred.lock().user_ns.from_kuid(self.uid))
+            }
+            None => (self.pid, self.uid),
+        };
         let mut b = [0u8; 128];
         b[0..4].copy_from_slice(&(self.signo as i32).to_le_bytes());
         b[4..8].copy_from_slice(&self.errno.to_le_bytes());
@@ -145,8 +154,8 @@ impl SigInfo {
         if fault {
             b[16..24].copy_from_slice(&(self.addr as u64).to_le_bytes());
         } else if self.signo == SIGCHLD && self.code > 0 {
-            b[16..20].copy_from_slice(&self.pid.to_le_bytes());
-            b[20..24].copy_from_slice(&self.uid.to_le_bytes());
+            b[16..20].copy_from_slice(&vpid.to_le_bytes());
+            b[20..24].copy_from_slice(&vuid.to_le_bytes());
             b[24..28].copy_from_slice(&self.status.to_le_bytes());
             b[32..40].copy_from_slice(&self.utime.to_le_bytes());
             b[40..48].copy_from_slice(&self.stime.to_le_bytes());
@@ -154,8 +163,8 @@ impl SigInfo {
             b[16..24].copy_from_slice(&self.band.to_le_bytes());
             b[24..28].copy_from_slice(&self.fd.to_le_bytes());
         } else {
-            b[16..20].copy_from_slice(&self.pid.to_le_bytes());
-            b[20..24].copy_from_slice(&self.uid.to_le_bytes());
+            b[16..20].copy_from_slice(&vpid.to_le_bytes());
+            b[20..24].copy_from_slice(&vuid.to_le_bytes());
             b[24..32].copy_from_slice(&(self.value as u64).to_le_bytes());
         }
         b
@@ -167,8 +176,15 @@ impl SigInfo {
             signo: i32at(0) as u32,
             errno: i32at(4),
             code: i32at(8),
-            pid: i32at(16),
-            uid: i32at(20) as u32,
+            // the sender's view of pid and uid, as global ids
+            pid: match super::try_current_proc() {
+                Some(p) if i32at(16) > 0 => p.pid_ns.global_of(i32at(16) as u32).map_or(0, |g| g as i32),
+                _ => i32at(16),
+            },
+            uid: match super::try_current_proc() {
+                Some(p) => p.cred.lock().user_ns.make_kuid(i32at(20) as u32).unwrap_or(crate::ns::OVERFLOW_ID),
+                None => i32at(20) as u32,
+            },
             value: u64::from_le_bytes(b[24..32].try_into().unwrap()) as usize,
             ..Default::default()
         }
@@ -212,7 +228,13 @@ impl SigPending {
     }
 }
 
+/// Whether a signal sent to `th` would be discarded: ignored, and not blocked (a blocked signal
+/// stays pending, as Linux's sig_ignored: the handler may change before it is unblocked, and
+/// signalfd reads blocked signals).
 fn is_ignored(th: &UserThread, sig: u32) -> bool {
+    if th.sigmask.load(Ordering::Relaxed) as u64 & (1u64 << (sig - 1)) != 0 {
+        return false;
+    }
     let a = th.sighand.lock().act[sig as usize];
     a.handler == SIG_IGN || (a.handler == SIG_DFL && default_ignored(sig))
 }

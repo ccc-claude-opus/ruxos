@@ -42,10 +42,10 @@ impl DEntry {
     /// The child `name`, from the cache or the file system (negative entries are cached too).
     pub fn child(self: &Arc<DEntry>, name: &[u8]) -> Result<Arc<DEntry>> {
         let cache = self.fs.cache_dentries();
-        if cache {
-            if let Some(d) = self.children.lock().get(name) {
-                return Ok(d.clone());
-            }
+        // file systems that do not cache dentries still keep their mount points here (pinned by
+        // Mount::attach), so what is mounted on them is found again
+        if let Some(d) = self.children.lock().get(name) {
+            return Ok(d.clone());
         }
         let dir = self.inode()?;
         let inode = match dir.lookup(name) {
@@ -122,9 +122,18 @@ pub const MNT_NOEXEC: u32 = 8;
 pub const MNT_NOATIME: u32 = 0x400;
 pub const MNT_RELATIME: u32 = 0x200000;
 
+/// The flags a less privileged mount namespace may not clear on mounts it copied, and the mark of a
+/// mount it may not unmount on its own (it would uncover what is beneath), as Linux's MNT_LOCK_*.
+pub const MNT_LOCK_FLAGS: u32 = MNT_RDONLY | MNT_NOSUID | MNT_NODEV | MNT_NOEXEC | MNT_NOATIME | MNT_RELATIME;
+pub const MNT_LOCKED: u32 = 1 << 31;
+
 pub struct Mount {
     pub id: u32,
     pub root: Arc<DEntry>,
+    /// MNT_LOCK_FLAGS bits that are locked, and MNT_LOCKED
+    pub locked: AtomicU32,
+    /// the mount namespace this mount belongs to
+    pub ns: SpinLock<alloc::sync::Weak<MntNs>>,
     /// (parent mount, mount point) — None for the root of a namespace.
     pub parent: SpinLock<Option<(Arc<Mount>, Arc<DEntry>)>>,
     pub children: SpinLock<Vec<Arc<Mount>>>,
@@ -141,6 +150,8 @@ impl Mount {
         Arc::new(Mount {
             id: NEXT_MNT.fetch_add(1, Ordering::Relaxed),
             root,
+            locked: AtomicU32::new(0),
+            ns: SpinLock::new(alloc::sync::Weak::new()),
             parent: SpinLock::new(None),
             children: SpinLock::new(Vec::new()),
             flags: AtomicU32::new(flags),
@@ -166,7 +177,21 @@ impl Mount {
 
     /// Attaches `child` at `at` (a dentry of self).
     pub fn attach(self: &Arc<Mount>, at: &Arc<DEntry>, child: &Arc<Mount>) {
+        // a mount point of a file system without a dentry cache stays in its parent's children,
+        // and so do its ancestors (up to the file system's root), so lookups find it again
+        if !at.fs.cache_dentries() {
+            let mut d = at.clone();
+            while let Some(p) = d.parent() {
+                let name = d.name.lock().clone();
+                let kept = p.children.lock().entry(name).or_insert_with(|| d.clone()).clone();
+                if !Arc::ptr_eq(&kept, &d) {
+                    break; // already pinned from here up
+                }
+                d = p;
+            }
+        }
         *child.parent.lock() = Some((self.clone(), at.clone()));
+        set_ns(child, &self.ns.lock().clone());
         self.children.lock().push(child.clone());
     }
 
@@ -175,6 +200,104 @@ impl Mount {
         if let Some((pm, _)) = p {
             pm.children.lock().retain(|m| !Arc::ptr_eq(m, self));
         }
+    }
+}
+
+/// `m` and the mounts below it belong to namespace `ns`.
+fn set_ns(m: &Arc<Mount>, ns: &alloc::sync::Weak<MntNs>) {
+    *m.ns.lock() = ns.clone();
+    for c in m.children.lock().clone() {
+        set_ns(&c, ns);
+    }
+}
+
+/// A mount namespace: a tree of mounts.
+pub struct MntNs {
+    pub ino: u64,
+    pub user_ns: Arc<crate::ns::UserNs>,
+    pub root: SpinLock<Arc<Mount>>,
+}
+
+static ALL_MNT_NS: SpinLock<Vec<alloc::sync::Weak<MntNs>>> = SpinLock::new(Vec::new());
+
+impl MntNs {
+    fn register(ns: Arc<MntNs>) -> Arc<MntNs> {
+        set_ns(&ns.root.lock().clone(), &Arc::downgrade(&ns));
+        let mut a = ALL_MNT_NS.lock();
+        a.retain(|w| w.strong_count() > 0);
+        a.push(Arc::downgrade(&ns));
+        ns
+    }
+
+    /// The initial namespace, whose tree contains `m`.
+    pub fn new_init(mut m: Arc<Mount>) -> Arc<MntNs> {
+        loop {
+            let p = m.parent.lock().clone();
+            match p {
+                Some((p, _)) => m = p,
+                None => break,
+            }
+        }
+        Self::register(Arc::new(MntNs { ino: crate::ns::INO_MNT, user_ns: crate::ns::init_user_ns(), root: SpinLock::new(m) }))
+    }
+
+    /// CLONE_NEWNS: a copy of `old`'s tree owned by `user`. When `user` is less privileged than the
+    /// owner of `old`, the copied mounts keep their flags and stay together (MNT_LOCK_*). The root
+    /// and working directory in `fs` move to the copies.
+    pub fn copy(old: &Arc<MntNs>, user: Arc<crate::ns::UserNs>, fs: Option<&mut crate::task::FsContext>) -> Result<Arc<MntNs>> {
+        let lock = !Arc::ptr_eq(&user, &old.user_ns);
+        let mut map: Vec<(Arc<Mount>, Arc<Mount>)> = Vec::new();
+        fn dup(m: &Arc<Mount>, lock: bool, top: bool, map: &mut Vec<(Arc<Mount>, Arc<Mount>)>) -> Arc<Mount> {
+            let n = Mount::new(m.root.clone(), m.flags(), &m.source, &m.fstype, &m.options);
+            let mut l = m.locked.load(Ordering::Relaxed);
+            if lock {
+                l |= m.flags() & MNT_LOCK_FLAGS;
+                if !top {
+                    l |= MNT_LOCKED;
+                }
+            }
+            n.locked.store(l, Ordering::Relaxed);
+            map.push((m.clone(), n.clone()));
+            for c in m.children.lock().clone() {
+                let at = c.parent.lock().as_ref().map(|(_, d)| d.clone());
+                if let Some(at) = at {
+                    let cn = dup(&c, lock, false, map);
+                    *cn.parent.lock() = Some((n.clone(), at));
+                    n.children.lock().push(cn);
+                }
+            }
+            n
+        }
+        let root = dup(&old.root.lock().clone(), lock, true, &mut map);
+        let ns = Self::register(Arc::new(MntNs { ino: crate::ns::new_ino_pub(), user_ns: user, root: SpinLock::new(root) }));
+        if let Some(f) = fs {
+            let tr = |p: &PathRef| -> PathRef {
+                match map.iter().find(|(o, _)| Arc::ptr_eq(o, &p.mnt)) {
+                    Some((_, n)) => PathRef { mnt: n.clone(), d: p.d.clone() },
+                    None => p.clone(),
+                }
+            };
+            f.root = tr(&f.root);
+            f.cwd = tr(&f.cwd);
+        }
+        Ok(ns)
+    }
+
+    /// Every mount of every namespace.
+    pub fn all_mounts() -> Vec<Arc<Mount>> {
+        let nss: Vec<Arc<MntNs>> = ALL_MNT_NS.lock().iter().filter_map(|w| w.upgrade()).collect();
+        let mut out = Vec::new();
+        fn walk(m: &Arc<Mount>, out: &mut Vec<Arc<Mount>>) {
+            out.push(m.clone());
+            for c in m.children.lock().clone() {
+                walk(&c, out);
+            }
+        }
+        for n in nss {
+            let r = n.root.lock().clone();
+            walk(&r, &mut out);
+        }
+        out
     }
 }
 
@@ -194,7 +317,7 @@ impl PathRef {
     }
 
     /// Steps into whatever is mounted here.
-    fn cross_down(mut self) -> PathRef {
+    pub fn cross_down(mut self) -> PathRef {
         while let Some(m) = self.mnt.mounted_on(&self.d) {
             self.d = m.root.clone();
             self.mnt = m;
@@ -284,9 +407,13 @@ pub struct Lookup<'a> {
     pub root: &'a PathRef,
     pub cred: &'a Cred,
     pub follow_last: bool,
-    /// openat2 RESOLVE_IN_ROOT / RESOLVE_BENEATH, RESOLVE_NO_SYMLINKS, RESOLVE_NO_MAGICLINKS
+    /// openat2 RESOLVE_BENEATH: leaving `root` (an absolute path, ".." above it) fails with EXDEV
+    /// (RESOLVE_IN_ROOT instead just makes the start directory the root)
     pub beneath: bool,
+    /// RESOLVE_NO_SYMLINKS, RESOLVE_NO_MAGICLINKS (ELOOP), RESOLVE_NO_XDEV (EXDEV on a mount crossing)
     pub no_symlinks: bool,
+    pub no_magiclinks: bool,
+    pub no_xdev: bool,
 }
 
 const MAX_SYMLINKS: usize = 40;
@@ -325,6 +452,9 @@ impl Lookup<'_> {
         if path.len() > 4096 {
             return Err(ENAMETOOLONG);
         }
+        if path[0] == b'/' && self.beneath {
+            return Err(EXDEV);
+        }
         let mut cur = if path[0] == b'/' { self.root.clone() } else { start.clone() };
         let comps: Vec<&[u8]> = path.split(|&c| c == b'/').filter(|c| !c.is_empty() && *c != b".").collect();
         let must_dir = path.ends_with(b"/");
@@ -336,7 +466,14 @@ impl Lookup<'_> {
             }
             may(&dir, 1, self.cred)?;
             if *comp == b".." {
-                cur = cur.up(self.root);
+                if self.beneath && cur.same(self.root) {
+                    return Err(EXDEV);
+                }
+                let up = cur.up(self.root);
+                if self.no_xdev && !Arc::ptr_eq(&up.mnt, &cur.mnt) {
+                    return Err(EXDEV);
+                }
+                cur = up;
                 continue;
             }
             if comp.len() > 255 {
@@ -344,6 +481,9 @@ impl Lookup<'_> {
             }
             let d = cur.d.child(comp)?;
             let next = PathRef { mnt: cur.mnt.clone(), d }.cross_down();
+            if self.no_xdev && !Arc::ptr_eq(&next.mnt, &cur.mnt) {
+                return Err(EXDEV);
+            }
             let inode = next.inode()?;
             let st = inode.stat()?;
             if st.mode & S_IFMT == S_IFLNK && (!last || follow_last || must_dir) {
@@ -353,6 +493,13 @@ impl Lookup<'_> {
                 *links += 1;
                 if *links > MAX_SYMLINKS {
                     return Err(ELOOP);
+                }
+                if let Some(t) = inode.magic_target() {
+                    if self.no_magiclinks || self.beneath {
+                        return Err(ELOOP);
+                    }
+                    cur = t?;
+                    continue;
                 }
                 let target = inode.readlink()?;
                 if target.is_empty() {

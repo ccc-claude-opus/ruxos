@@ -403,8 +403,10 @@ impl FileOps for SignalFd {
                 b[0..4].copy_from_slice(&i.signo.to_le_bytes());
                 b[4..8].copy_from_slice(&i.errno.to_le_bytes());
                 b[8..12].copy_from_slice(&i.code.to_le_bytes());
-                b[12..16].copy_from_slice(&(i.pid as u32).to_le_bytes());
-                b[16..20].copy_from_slice(&i.uid.to_le_bytes());
+                // the reader's view of the sender (global ids inside the kernel)
+                let (pid, uid, _) = crate::task::view_creds((i.pid.max(0) as u32, i.uid, 0));
+                b[12..16].copy_from_slice(&pid.to_le_bytes());
+                b[16..20].copy_from_slice(&uid.to_le_bytes());
                 b[20..24].copy_from_slice(&i.fd.to_le_bytes());
                 b[44..48].copy_from_slice(&i.status.to_le_bytes());
                 b[56..64].copy_from_slice(&(i.value as u64).to_le_bytes());

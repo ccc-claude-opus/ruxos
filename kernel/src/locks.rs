@@ -109,7 +109,7 @@ pub fn fcntl_lock(f: &Arc<File>, cmd: u32, arg: usize) -> Result<usize> {
                     out[8..16].copy_from_slice(&(l.start as i64).to_le_bytes());
                     let len = if l.end == i64::MAX as u64 { 0 } else { (l.end - l.start + 1) as i64 };
                     out[16..24].copy_from_slice(&len.to_le_bytes());
-                    out[24..28].copy_from_slice(&(if ofd { -1 } else { l.pid as i32 }).to_le_bytes());
+                    out[24..28].copy_from_slice(&(if ofd { -1 } else { crate::task::vpid(l.pid) as i32 }).to_le_bytes());
                 }
             }
             write_user(arg, &out)?;

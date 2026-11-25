@@ -83,6 +83,10 @@ fn reprogram() {
             next = d;
         }
     }
+    let tw = pc.throttle_wake.load(Ordering::Relaxed);
+    if tw != 0 && (next == 0 || tw < next) {
+        next = tw;
+    }
     if next == 0 { arch::stop_timer() } else { arch::set_timer(next) }
     arch::irq_restore(irq);
 }
@@ -90,9 +94,24 @@ fn reprogram() {
 /// A new task got the CPU: its time slice starts (the idle task has none).
 pub fn start_slice() {
     let pc = percpu::this();
-    let idle = crate::sched::current().is_idle;
-    unsafe { *pc.slice_end.get() = if idle { 0 } else { arch::ticks() + ns_to_ticks(SLICE_NS) } };
+    let cur = crate::sched::current();
+    let idle = cur.is_idle;
+    // a task of a cgroup with cpu.max: the slice ends no later than its quota
+    let slice = match crate::task::thread_of(cur).and_then(|th| crate::cgroup::runtime_left(&th.proc)) {
+        Some(left) => SLICE_NS.min(left.max(100_000)),
+        None => SLICE_NS,
+    };
+    unsafe { *pc.slice_end.get() = if idle { 0 } else { arch::ticks() + ns_to_ticks(slice) } };
     reprogram();
+}
+
+/// Throttled tasks (cpu.max) on this CPU may run again in `ns`: be woken then.
+pub fn throttle_timer(pc: &percpu::PerCpu, ns: u64) {
+    let at = arch::ticks() + ns_to_ticks(ns);
+    let cur = pc.throttle_wake.load(Ordering::Relaxed);
+    if cur == 0 || at < cur {
+        pc.throttle_wake.store(at, Ordering::Relaxed);
+    }
 }
 
 pub fn idle_timer() {
@@ -103,6 +122,25 @@ pub fn idle_timer() {
 pub fn timer_interrupt() {
     let pc = percpu::this();
     let now = arch::ticks();
+    // the period of a throttled cgroup is over: look at the queue again
+    let tw = pc.throttle_wake.load(Ordering::Relaxed);
+    if tw != 0 && now >= tw {
+        pc.throttle_wake.store(0, Ordering::Relaxed);
+        pc.need_resched.store(true, Ordering::Relaxed);
+    }
+    // the running task's cgroup used up its quota: give the CPU up
+    if crate::cgroup::CPU_LIMITED.load(Ordering::Relaxed) != 0 {
+        let cur = crate::sched::current();
+        if !cur.is_idle {
+            if let Some(th) = crate::task::thread_of(cur) {
+                let ran = now.saturating_sub(pc.run_start.swap(now, Ordering::Relaxed));
+                crate::cgroup::charge_cpu(&th.proc, ticks_to_ns(ran));
+                if crate::cgroup::throttled(&th.proc).is_some() {
+                    pc.need_resched.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
     loop {
         let t = {
             let mut tm = pc.timers.lock();

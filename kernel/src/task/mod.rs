@@ -7,6 +7,7 @@ pub mod signal;
 use crate::arch::{self, FpState, TrapFrame};
 use crate::errno::*;
 use crate::mm::vm::Mm;
+use crate::ns;
 use crate::sched::{self, Task, WaitQueue};
 use crate::sync::SpinLock;
 use crate::vfs::file::SharedFds;
@@ -34,7 +35,12 @@ pub struct Cred {
     pub cap_perm: u64,
     pub cap_inh: u64,
     pub cap_bnd: u64,
+    pub cap_amb: u64,
     pub no_new_privs: bool,
+    /// PR_SET_KEEPCAPS: keep the permitted capabilities when the uids stop being 0 (cleared by execve)
+    pub keepcaps: bool,
+    /// the user namespace the ids and capabilities belong to
+    pub user_ns: Arc<crate::ns::UserNs>,
 }
 
 pub const CAP_ALL: u64 = (1 << 41) - 1;
@@ -55,10 +61,22 @@ impl Cred {
             cap_perm: CAP_ALL,
             cap_inh: 0,
             cap_bnd: CAP_ALL,
+            cap_amb: 0,
             no_new_privs: false,
+            keepcaps: false,
+            user_ns: crate::ns::init_user_ns(),
         }
     }
+    /// The capability over the whole system (in the initial user namespace).
     pub fn capable(&self, cap: u32) -> bool {
+        crate::ns::ns_capable(self, &crate::ns::init_user_ns(), cap)
+    }
+    /// The capability over objects that belong to user namespace `ns`.
+    pub fn ns_capable(&self, ns: &Arc<crate::ns::UserNs>, cap: u32) -> bool {
+        crate::ns::ns_capable(self, ns, cap)
+    }
+    /// The capability in the credential's own user namespace (setuid, capset...).
+    pub fn own_capable(&self, cap: u32) -> bool {
         self.cap_eff & (1 << cap) != 0
     }
 }
@@ -118,9 +136,17 @@ pub struct Process {
     /// signalfds reading this process's signals (notified when one is sent).
     pub signalfds: SpinLock<Vec<Weak<crate::vfs::poll::PollQueue>>>,
     pub itimer_gen: core::sync::atomic::AtomicU64,
+    /// the namespaces (user: in `cred`)
+    pub ns: SpinLock<crate::ns::NsProxy>,
+    /// the PID namespace the process is in (its pid there is `pid_ns.local_of(pid)`)
+    pub pid_ns: Arc<crate::ns::PidNs>,
 }
 
 impl Process {
+    /// Resident user pages (charged to the memory controller).
+    pub fn mm_pages(&self) -> u64 {
+        self.leader().and_then(|l| thread_of(&l).map(|t| t.mm.rss_pages())).unwrap_or(0)
+    }
     pub fn is_zombie(&self) -> bool {
         self.state.lock().exit_status.is_some()
     }
@@ -153,6 +179,9 @@ pub struct UserThread {
     pub vfork_done: SpinLock<Option<Arc<Completion>>>,
     /// This thread alone must exit (another thread is executing a new program).
     pub exit_now: AtomicBool,
+    /// seccomp mode and filters (inherited by new threads and processes, kept across execve)
+    pub seccomp_mode: AtomicU32,
+    pub seccomp: SpinLock<Option<Arc<crate::seccomp::Filter>>>,
 }
 
 unsafe impl Sync for UserThread {}
@@ -211,6 +240,47 @@ pub fn own() -> &'static mut Own {
 
 pub fn current_proc() -> &'static Arc<Process> {
     &current_thread().proc
+}
+
+pub fn try_current_proc() -> Option<&'static Arc<Process>> {
+    try_current_thread().map(|t| &t.proc)
+}
+
+/// Global pid/tid `g` as the current process sees it (0: outside its PID namespace).
+pub fn vpid(g: u32) -> u32 {
+    match try_current_proc() {
+        Some(p) => p.pid_ns.local_of(g),
+        None => g,
+    }
+}
+
+/// The global pid/tid of `local` in the current process's PID namespace.
+pub fn gpid(local: u32) -> Option<u32> {
+    match try_current_proc() {
+        Some(p) => p.pid_ns.global_of(local),
+        None => Some(local),
+    }
+}
+
+/// (pid, uid, gid) kept as global ids, as the current process sees them.
+pub fn view_creds(c: (u32, u32, u32)) -> (u32, u32, u32) {
+    match try_current_proc() {
+        Some(p) => {
+            let cr = p.cred.lock();
+            (if c.0 == 0 { 0 } else { p.pid_ns.local_of(c.0) }, cr.user_ns.from_kuid(c.1), cr.user_ns.from_kgid(c.2))
+        }
+        None => c,
+    }
+}
+
+/// A process by its pid in the caller's PID namespace.
+pub fn proc_by_vpid(local: u32) -> Option<Arc<Process>> {
+    proc_by_pid(gpid(local)?)
+}
+
+/// A thread by its tid in the caller's PID namespace.
+pub fn task_by_vtid(local: u32) -> Option<Arc<Task>> {
+    task_by_tid(gpid(local)?)
 }
 
 pub fn task_by_tid(tid: u32) -> Option<Arc<Task>> {
@@ -303,7 +373,11 @@ pub fn make_init(root: PathRef) -> Arc<Process> {
         pidfd_wq: crate::vfs::poll::PollQueue::new(),
         signalfds: SpinLock::new(Vec::new()),
         itimer_gen: core::sync::atomic::AtomicU64::new(0),
+        ns: SpinLock::new(crate::ns::init_nsproxy(crate::vfs::MntNs::new_init(root.mnt.clone()))),
+        pid_ns: crate::ns::init_pid_ns(),
     });
+    *proc.pid_ns.reaper.lock() = Arc::downgrade(&proc);
+    crate::cgroup::join_root(&proc);
     let th = UserThread {
         proc: proc.clone(),
         mm: Mm::new(),
@@ -327,6 +401,8 @@ pub fn make_init(root: PathRef) -> Arc<Process> {
         comm: SpinLock::new(*b"init\0\0\0\0\0\0\0\0\0\0\0\0"),
         vfork_done: SpinLock::new(None),
         exit_now: AtomicBool::new(false),
+        seccomp_mode: AtomicU32::new(0),
+        seccomp: SpinLock::new(None),
     };
     unsafe { *me.user.get() = Some(alloc::boxed::Box::new(th)) };
     TASKS.lock().insert(me.tid, Arc::downgrade(&me));
@@ -369,8 +445,20 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: usize, ctid: usize, fra
     if flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0 {
         return Err(EINVAL);
     }
-    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET) != 0 {
-        return Err(EINVAL); // namespaces: milestone M8
+    // namespaces (clone(2)): not for threads, and a new user or mount namespace needs its own fs
+    if flags & (CLONE_NEWUSER | CLONE_NEWPID) != 0 && flags & CLONE_THREAD != 0 {
+        return Err(EINVAL);
+    }
+    if flags & (CLONE_NEWUSER | CLONE_NEWNS) != 0 && flags & CLONE_FS != 0 {
+        return Err(EINVAL);
+    }
+    let mut cred = proc.cred();
+    if flags & CLONE_NEWUSER != 0 {
+        cred = new_user_cred(&cred, &me.fs.lock())?;
+    }
+    let ns_before = proc.ns.lock().clone();
+    if flags & CLONE_THREAD != 0 && !Arc::ptr_eq(&ns_before.pid_for_children, &proc.pid_ns) {
+        return Err(EINVAL);
     }
     let mm = if flags & CLONE_VM != 0 { me.mm.clone() } else { me.mm.fork()? };
     let files = if flags & CLONE_FILES != 0 { me.files.clone() } else { Arc::new(SpinLock::new(me.files.lock().clone())) };
@@ -380,6 +468,18 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: usize, ctid: usize, fra
         let f = me.fs.lock();
         Arc::new(SpinLock::new(FsContext { root: f.root.clone(), cwd: f.cwd.clone(), umask: f.umask }))
     };
+    let nsp = if flags & ns::CLONE_NEW_ANY != 0 {
+        let cg = crate::cgroup::path_of(proc);
+        ns::copy_namespaces(flags, &ns_before, &cred, Some(&mut fs.lock()), &cg)?
+    } else {
+        ns_before
+    };
+    let pid_ns = if flags & CLONE_THREAD != 0 { proc.pid_ns.clone() } else { nsp.pid_for_children.clone() };
+    if pid_ns.dead.load(Ordering::Relaxed) {
+        return Err(ENOMEM);
+    }
+    // pids controller: the new task counts against the cgroup it starts in (the parent's)
+    crate::cgroup::charge_task(proc)?;
     let sighand = if flags & CLONE_SIGHAND != 0 {
         me.sighand.clone()
     } else {
@@ -423,7 +523,7 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: usize, ctid: usize, fra
             sid: AtomicU32::new(proc.sid.load(Ordering::Relaxed)),
             state: SpinLock::new(ProcState { exit_status: None, reaped: false, stop_report: None, cont_report: false }),
             child_wq: WaitQueue::new(),
-            cred: SpinLock::new(proc.cred()),
+            cred: SpinLock::new(cred),
             rlimits: SpinLock::new(*proc.rlimits.lock()),
             pending: SpinLock::new(SigPending::default()),
             exit_signal: (flags & 0xff) as u32,
@@ -443,11 +543,21 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: usize, ctid: usize, fra
             pidfd_wq: crate::vfs::poll::PollQueue::new(),
         signalfds: SpinLock::new(Vec::new()),
             itimer_gen: core::sync::atomic::AtomicU64::new(0),
+            ns: SpinLock::new(nsp),
+            pid_ns: pid_ns.clone(),
         });
+        crate::cgroup::fork(proc, &p);
         parent.children.lock().push(p.clone());
         PROCS.lock().insert(tid, Arc::downgrade(&p));
         p
     };
+    // the new task's ids in its PID namespace and the ones above it; pid 1 of a new namespace
+    // becomes its reaper
+    let local = pid_ns.attach(tid);
+    if local == 1 && !pid_ns.is_init() {
+        *pid_ns.reaper.lock() = Arc::downgrade(&new_proc);
+    }
+    let parent_view = proc.pid_ns.local_of(tid);
     new_proc.live_threads.fetch_add(1, Ordering::SeqCst);
     new_proc.threads.lock().push(Arc::downgrade(&task));
 
@@ -475,18 +585,20 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: usize, ctid: usize, fra
         comm: SpinLock::new(*me.comm.lock()),
         vfork_done: SpinLock::new(vfork.clone()),
         exit_now: AtomicBool::new(false),
+        seccomp_mode: AtomicU32::new(me.seccomp_mode.load(Ordering::Relaxed)),
+        seccomp: SpinLock::new(me.seccomp.lock().clone()),
     };
     unsafe { *task.user.get() = Some(alloc::boxed::Box::new(th)) };
     TASKS.lock().insert(tid, Arc::downgrade(&task));
 
     if flags & CLONE_PARENT_SETTID != 0 {
-        crate::mm::vm::write_user(ptid, &(tid as i32))?;
+        crate::mm::vm::write_user(ptid, &(parent_view as i32))?;
     }
     if flags & CLONE_CHILD_SETTID != 0 {
         // in the child's address space (the same one unless fork)
         let child_mm = thread_of(&task).unwrap().mm.clone();
         let pa = child_mm.get_user_page(ctid, crate::mm::vm::Access::Write)?;
-        unsafe { *((arch::phys_to_virt(pa) + (ctid & 0xfff)) as *mut i32) = tid as i32 };
+        unsafe { *((arch::phys_to_virt(pa) + (ctid & 0xfff)) as *mut i32) = local as i32 };
         crate::mm::frame::put_page(pa);
     }
     task.cpu.store(crate::percpu::this().id, Ordering::Relaxed);
@@ -494,7 +606,36 @@ pub fn clone(flags: u64, stack: usize, ptid: usize, tls: usize, ctid: usize, fra
     if let Some(c) = vfork {
         c.wait();
     }
-    Ok(tid)
+    Ok(parent_view)
+}
+
+/// The credentials of a process that creates a user namespace: all capabilities there, none of the
+/// old ones (user_namespaces(7)). Not allowed from a chroot.
+pub fn new_user_cred(old: &Cred, fs: &FsContext) -> Result<Cred> {
+    let ns_root = fs_ns_root(fs);
+    if !fs.root.same(&ns_root) {
+        return Err(EPERM);
+    }
+    let mut c = old.clone();
+    c.user_ns = crate::ns::new_user_ns(old)?;
+    c.cap_eff = CAP_ALL;
+    c.cap_perm = CAP_ALL;
+    c.cap_inh = 0;
+    c.cap_bnd = CAP_ALL;
+    c.cap_amb = 0;
+    c.keepcaps = false;
+    Ok(c)
+}
+
+/// The root of the mount namespace `fs.root` is in.
+fn fs_ns_root(fs: &FsContext) -> PathRef {
+    match fs.root.mnt.ns.lock().upgrade() {
+        Some(n) => {
+            let r = n.root.lock().clone();
+            PathRef { d: r.root.clone(), mnt: r }
+        }
+        None => fs.root.clone(),
+    }
 }
 
 extern "C" fn user_thread_start(_: usize) {
@@ -536,7 +677,11 @@ pub fn exit(code: i32, group: bool) -> ! {
     let status = if proc.group_exit.load(Ordering::SeqCst) { proc.group_exit_code.load(Ordering::SeqCst) } else { code };
     let me_task = sched::current_arc();
     TASKS.lock().remove(&me_task.tid);
+    if me_task.tid != proc.pid {
+        proc.pid_ns.detach(me_task.tid);
+    }
     proc.threads.lock().retain(|w| w.upgrade().is_some_and(|t| !Arc::ptr_eq(&t, &me_task)));
+    crate::cgroup::task_gone(&proc);
     let last = proc.live_threads.fetch_sub(1, Ordering::SeqCst) == 1;
     // drop our references to shared state while we can still sleep
     {
@@ -555,7 +700,33 @@ pub fn exit(code: i32, group: bool) -> ! {
 /// The last thread of `proc` is gone: zombie it, reparent its children, tell the parent.
 fn process_exit(proc: &Arc<Process>, status: i32) {
     crate::locks::release_process(proc.pid);
-    let init = INIT.get().cloned();
+    // pid 1 of a PID namespace takes the namespace down with it (pid_namespaces(7))
+    let ns = proc.pid_ns.clone();
+    let is_reaper = ns.reaper.lock().upgrade().is_some_and(|r| Arc::ptr_eq(&r, proc));
+    if is_reaper && !ns.is_init() {
+        ns.dead.store(true, Ordering::SeqCst);
+        for g in ns.members() {
+            if g == proc.pid {
+                continue;
+            }
+            if let Some(p) = PROCS.lock().get(&g).and_then(|w| w.upgrade()) {
+                signal::send_process(&p, SigInfo::kernel(signal::SIGKILL));
+            }
+        }
+    }
+    // orphans go to the reaper of their namespace (or of the one above when that is us)
+    let mut rns = Some(ns.clone());
+    let mut init = None;
+    while let Some(n) = rns {
+        if let Some(r) = n.reaper.lock().upgrade() {
+            if !Arc::ptr_eq(&r, proc) && !r.is_zombie() {
+                init = Some(r);
+                break;
+            }
+        }
+        rns = n.parent.clone();
+    }
+    let init = init.or_else(|| INIT.get().cloned());
     let orphans: Vec<Arc<Process>> = core::mem::take(&mut *proc.children.lock());
     if let Some(init) = &init {
         for c in orphans {
@@ -584,6 +755,7 @@ fn process_exit(proc: &Arc<Process>, status: i32) {
                 let mut info = SigInfo::kernel(proc.exit_signal);
                 info.code = if status & 0x7f == 0 { 1 } else { 2 }; // CLD_EXITED / CLD_KILLED
                 info.pid = proc.pid as i32;
+                info.uid = proc.cred.lock().uid;
                 info.status = if status & 0x7f == 0 { (status >> 8) & 0xff } else { status & 0x7f };
                 signal::send_process(&parent, info);
             }
@@ -595,15 +767,22 @@ fn process_exit(proc: &Arc<Process>, status: i32) {
             }
         }
         None => {
-            PROCS.lock().remove(&proc.pid);
+            forget(proc);
         }
     }
+}
+
+/// A reaped process: its pid is free again.
+fn forget(p: &Arc<Process>) {
+    PROCS.lock().remove(&p.pid);
+    p.pid_ns.detach(p.pid);
+    crate::cgroup::exit(p);
 }
 
 fn reap(parent: &Arc<Process>, child: &Arc<Process>) {
     child.state.lock().reaped = true;
     parent.children.lock().retain(|c| !Arc::ptr_eq(c, child));
-    PROCS.lock().remove(&child.pid);
+    forget(child);
 }
 
 pub const WNOHANG: u32 = 1;
@@ -618,7 +797,8 @@ pub enum WaitWho {
     Pgid(u32),
 }
 
-/// wait4/waitid: Ok(Some((pid, status))) or Ok(None) with WNOHANG and nothing to report.
+/// wait4/waitid: Ok(Some((pid, status))) or Ok(None) with WNOHANG and nothing to report. The pid
+/// is in the caller's PID namespace.
 pub fn wait(who: WaitWho, options: u32) -> Result<Option<(u32, i32, u32)>> {
     let me = current_proc().clone();
     let mut found: Option<(u32, i32, u32)> = None;
@@ -639,6 +819,8 @@ pub fn wait(who: WaitWho, options: u32) -> Result<Option<(u32, i32, u32)>> {
                 return true;
             }
             for c in matching {
+                // the pid as the waiter sees it (before reaping frees it)
+                let view = me.pid_ns.local_of(c.pid);
                 let mut st = c.state.lock();
                 if let (Some(s), false) = (st.exit_status, st.reaped) {
                     if options & WEXITED != 0 || options & (WUNTRACED | WCONTINUED) == 0 || true {
@@ -648,21 +830,21 @@ pub fn wait(who: WaitWho, options: u32) -> Result<Option<(u32, i32, u32)>> {
                             me.cutime.fetch_add(c.utime.load(Ordering::Relaxed), Ordering::Relaxed);
                             me.cstime.fetch_add(c.stime.load(Ordering::Relaxed), Ordering::Relaxed);
                             me.children.lock().retain(|x| !Arc::ptr_eq(x, &c));
-                            PROCS.lock().remove(&c.pid);
+                            forget(&c);
                         }
-                        found = Some((c.pid, s, 0));
+                        found = Some((view, s, 0));
                         return true;
                     }
                 }
                 if options & WUNTRACED != 0 {
                     if let Some(s) = st.stop_report.take() {
-                        found = Some((c.pid, s, 1));
+                        found = Some((view, s, 1));
                         return true;
                     }
                 }
                 if options & WCONTINUED != 0 && st.cont_report {
                     st.cont_report = false;
-                    found = Some((c.pid, 0xffff, 2));
+                    found = Some((view, 0xffff, 2));
                     return true;
                 }
             }

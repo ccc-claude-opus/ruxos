@@ -8,6 +8,9 @@ pub struct TmpFs {
     dev: u64,
     root: SpinLock<Option<Arc<TmpInode>>>,
     name: &'static str,
+    /// size= : the pages file data may take (u64::MAX: no limit), and the pages it takes now
+    max_pages: core::sync::atomic::AtomicU64,
+    used_pages: core::sync::atomic::AtomicU64,
 }
 
 pub struct TmpInode {
@@ -41,8 +44,20 @@ pub fn anon_dev() -> u64 {
 
 impl TmpFs {
     pub fn new(name: &'static str, mode: u32) -> Arc<TmpFs> {
-        let fs = Arc::new(TmpFs { dev: anon_dev(), root: SpinLock::new(None), name });
-        let root = TmpInode::new(&fs, S_IFDIR | (mode & 0o7777), 0, 0, 0);
+        Self::with_options(name, mode, 0, 0, u64::MAX)
+    }
+
+    /// A tmpfs whose root has `mode`, `uid`, `gid`, limited to `max_bytes` of file data.
+    pub fn with_options(name: &'static str, mode: u32, uid: u32, gid: u32, max_bytes: u64) -> Arc<TmpFs> {
+        let max_pages = if max_bytes == u64::MAX { u64::MAX } else { max_bytes.div_ceil(PAGE_SIZE as u64) };
+        let fs = Arc::new(TmpFs {
+            dev: anon_dev(),
+            root: SpinLock::new(None),
+            name,
+            max_pages: core::sync::atomic::AtomicU64::new(max_pages),
+            used_pages: core::sync::atomic::AtomicU64::new(0),
+        });
+        let root = TmpInode::new(&fs, S_IFDIR | (mode & 0o7777), 0, uid, gid);
         if let Kind::Dir(d) = &root.kind {
             d.lock().parent_ino = root.meta.lock().ino;
         }
@@ -63,12 +78,49 @@ impl FileSystem for TmpFs {
         self.dev
     }
     fn statfs(&self) -> StatFs {
-        let total = crate::mm::frame::TOTAL_PAGES.load(core::sync::atomic::Ordering::Relaxed) as u64;
+        use core::sync::atomic::Ordering::Relaxed;
+        let total = crate::mm::frame::TOTAL_PAGES.load(Relaxed) as u64;
         let free = crate::mm::frame::free_count() as u64;
+        let max = self.max_pages.load(Relaxed);
+        if max != u64::MAX {
+            let used = self.used_pages.load(Relaxed);
+            let avail = max.saturating_sub(used).min(free);
+            return StatFs { fs_type: 0x0102_1994, bsize: 4096, blocks: max, bfree: avail, bavail: avail, files: free, ffree: free, namelen: 255, flags: 0 };
+        }
         StatFs { fs_type: 0x0102_1994, bsize: 4096, blocks: total / 2, bfree: free / 2, bavail: free / 2, files: free, ffree: free, namelen: 255, flags: 0 }
     }
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+impl TmpFs {
+    /// A file grows from `old` to `new` bytes: ENOSPC past size=.
+    fn charge(&self, old: u64, new: u64) -> Result<()> {
+        use core::sync::atomic::Ordering::Relaxed;
+        let (o, n) = (old.div_ceil(PAGE_SIZE as u64), new.div_ceil(PAGE_SIZE as u64));
+        if n <= o {
+            return Ok(());
+        }
+        let max = self.max_pages.load(Relaxed);
+        self.used_pages
+            .try_update(Relaxed, Relaxed, |u| if max != u64::MAX && u + (n - o) > max { None } else { Some(u + (n - o)) })
+            .map(|_| ())
+            .map_err(|_| ENOSPC)
+    }
+
+    fn release(&self, bytes: u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let p = bytes.div_ceil(PAGE_SIZE as u64);
+        let _ = self.used_pages.try_update(Relaxed, Relaxed, |u| Some(u.saturating_sub(p)));
+    }
+}
+
+impl Drop for TmpInode {
+    fn drop(&mut self) {
+        if let (Kind::File { size, .. }, Some(fs)) = (&self.kind, self.fs.upgrade()) {
+            fs.release(*size.lock());
+        }
     }
 }
 
@@ -145,6 +197,13 @@ impl TmpInode {
     fn set_size(&self, new: u64) -> Result<()> {
         let Kind::File { cache, size } = &self.kind else { return Err(EINVAL) };
         let mut s = size.lock();
+        if new > *s {
+            self.tfs().charge(*s, new)?;
+        } else {
+            let fs = self.tfs();
+            fs.release(*s);
+            let _ = fs.charge(0, new);
+        }
         if new < *s {
             let first_gone = new.div_ceil(PAGE_SIZE as u64);
             cache.truncate_from(first_gone);
@@ -204,6 +263,20 @@ impl Inode for TmpInode {
 
     fn write_at(&self, off: u64, buf: &[u8]) -> Result<usize> {
         let Kind::File { cache, size } = &self.kind else { return Err(EINVAL) };
+        {
+            // the space for the new size first (size=)
+            let s = size.lock();
+            let end = off + buf.len() as u64;
+            if end > *s {
+                self.tfs().charge(*s, end)?;
+                drop(s);
+                // reserved; the size is set below, and charge() counts from it next time
+                let mut s = size.lock();
+                if end > *s {
+                    *s = end;
+                }
+            }
+        }
         let mut done = 0;
         while done < buf.len() {
             let p = off + done as u64;
@@ -247,6 +320,7 @@ impl Inode for TmpInode {
         let end = off + len;
         let mut s = size.lock();
         if end > *s {
+            self.tfs().charge(*s, end)?;
             *s = end;
         }
         Ok(())

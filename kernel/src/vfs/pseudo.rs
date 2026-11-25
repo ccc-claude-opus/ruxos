@@ -8,11 +8,15 @@ pub type Lister = Box<dyn Fn() -> Vec<(Vec<u8>, Arc<dyn Inode>)> + Send + Sync>;
 pub type Gen = Box<dyn Fn() -> Result<Vec<u8>> + Send + Sync>;
 pub type Writer = Box<dyn Fn(&[u8]) -> Result<()> + Send + Sync>;
 
+pub type Jump = Box<dyn Fn() -> Result<PathRef> + Send + Sync>;
+
+/// `owner`: the (global) pid whose effective uid and gid own the node, as /proc/PID; 0 = root.
 pub struct PDir {
     ino: u64,
     mode: u32,
     dev: u64,
     list: Lister,
+    owner: u32,
 }
 pub struct PFile {
     ino: u64,
@@ -20,11 +24,30 @@ pub struct PFile {
     dev: u64,
     generate: Gen,
     write: Option<Writer>,
+    owner: u32,
+    /// the permission bits as the caller sees them (sysctls whose access follows a capability)
+    mode_fn: Option<fn() -> u32>,
 }
 pub struct PLink {
     ino: u64,
     dev: u64,
     target: Gen,
+    jump: Option<Jump>,
+    owner: u32,
+}
+
+/// (uid, gid) of a node owned by process `pid` (its effective ids while it is dumpable, as Linux).
+fn owner_ids(pid: u32) -> (u32, u32) {
+    if pid == 0 {
+        return (0, 0);
+    }
+    match crate::task::proc_by_pid(pid) {
+        Some(p) if p.dumpable.load(core::sync::atomic::Ordering::Relaxed) == 1 => {
+            let c = p.cred.lock();
+            (c.euid, c.egid)
+        }
+        _ => (0, 0),
+    }
 }
 
 /// Stable inode numbers from a name path.
@@ -42,19 +65,36 @@ pub fn ino_of(parts: &[&[u8]]) -> u64 {
 }
 
 pub fn dir(dev: u64, ino: u64, mode: u32, list: Lister) -> Arc<dyn Inode> {
-    Arc::new(PDir { ino, mode: S_IFDIR | mode, dev, list })
+    Arc::new(PDir { ino, mode: S_IFDIR | mode, dev, list, owner: 0 })
 }
 pub fn file(dev: u64, ino: u64, mode: u32, generate: Gen, write: Option<Writer>) -> Arc<dyn Inode> {
-    Arc::new(PFile { ino, mode: S_IFREG | mode, dev, generate, write })
+    Arc::new(PFile { ino, mode: S_IFREG | mode, dev, generate, write, owner: 0, mode_fn: None })
+}
+/// A file whose permission bits depend on who asks (`mode_fn`).
+pub fn file_mode_fn(dev: u64, ino: u64, mode_fn: fn() -> u32, generate: Gen, write: Option<Writer>) -> Arc<dyn Inode> {
+    Arc::new(PFile { ino, mode: S_IFREG, dev, generate, write, owner: 0, mode_fn: Some(mode_fn) })
 }
 pub fn link(dev: u64, ino: u64, target: Gen) -> Arc<dyn Inode> {
-    Arc::new(PLink { ino, dev, target })
+    Arc::new(PLink { ino, dev, target, jump: None, owner: 0 })
+}
+pub fn dir_owned(dev: u64, ino: u64, mode: u32, list: Lister, owner: u32) -> Arc<dyn Inode> {
+    Arc::new(PDir { ino, mode: S_IFDIR | mode, dev, list, owner })
+}
+pub fn file_owned(dev: u64, ino: u64, mode: u32, generate: Gen, write: Option<Writer>, owner: u32) -> Arc<dyn Inode> {
+    Arc::new(PFile { ino, mode: S_IFREG | mode, dev, generate, write, owner, mode_fn: None })
+}
+pub fn link_owned(dev: u64, ino: u64, target: Gen, owner: u32) -> Arc<dyn Inode> {
+    Arc::new(PLink { ino, dev, target, jump: None, owner })
+}
+/// A magic link: readlink shows `target`, path walking goes to `jump`.
+pub fn magic_link(dev: u64, ino: u64, target: Gen, jump: Jump, owner: u32) -> Arc<dyn Inode> {
+    Arc::new(PLink { ino, dev, target, jump: Some(jump), owner })
 }
 pub fn text(s: alloc::string::String) -> Result<Vec<u8>> {
     Ok(s.into_bytes())
 }
 
-fn meta_stat(dev: u64, ino: u64, mode: u32, size: u64) -> Stat {
+pub fn meta_stat(dev: u64, ino: u64, mode: u32, size: u64) -> Stat {
     let now = Timespec::now();
     Stat { dev, ino, mode, nlink: 1, uid: 0, gid: 0, rdev: 0, size, blksize: 4096, blocks: 0, atime: now, mtime: now, ctime: now, btime: now }
 }
@@ -63,6 +103,7 @@ impl Inode for PDir {
     fn stat(&self) -> Result<Stat> {
         let mut s = meta_stat(self.dev, self.ino, self.mode, 0);
         s.nlink = 2;
+        (s.uid, s.gid) = owner_ids(self.owner);
         Ok(s)
     }
     fn setattr(&self, _a: &SetAttr) -> Result<()> {
@@ -91,7 +132,13 @@ impl Inode for PDir {
 
 impl Inode for PFile {
     fn stat(&self) -> Result<Stat> {
-        Ok(meta_stat(self.dev, self.ino, self.mode, 0))
+        let mode = match self.mode_fn {
+            Some(f) => S_IFREG | f(),
+            None => self.mode,
+        };
+        let mut s = meta_stat(self.dev, self.ino, mode, 0);
+        (s.uid, s.gid) = owner_ids(self.owner);
+        Ok(s)
     }
     fn setattr(&self, a: &SetAttr) -> Result<()> {
         if a.size.is_some() && self.write.is_none() {
@@ -176,10 +223,15 @@ impl FileOps for Snapshot {
 
 impl Inode for PLink {
     fn stat(&self) -> Result<Stat> {
-        Ok(meta_stat(self.dev, self.ino, S_IFLNK | 0o777, 0))
+        let mut s = meta_stat(self.dev, self.ino, S_IFLNK | 0o777, 0);
+        (s.uid, s.gid) = owner_ids(self.owner);
+        Ok(s)
     }
     fn readlink(&self) -> Result<Vec<u8>> {
         (self.target)()
+    }
+    fn magic_target(&self) -> Option<Result<PathRef>> {
+        self.jump.as_ref().map(|j| j())
     }
     fn as_any(&self) -> &dyn Any {
         self

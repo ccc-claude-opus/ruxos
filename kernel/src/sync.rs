@@ -121,13 +121,28 @@ impl<'a, T: ?Sized> SpinGuard<'a, T> {
 /// A value set once at boot and read-only afterwards.
 pub struct Once<T> {
     set: AtomicBool,
+    busy: AtomicBool,
     v: UnsafeCell<Option<T>>,
 }
 unsafe impl<T: Send + Sync> Sync for Once<T> {}
 
 impl<T> Once<T> {
     pub const fn new() -> Self {
-        Once { set: AtomicBool::new(false), v: UnsafeCell::new(None) }
+        Once { set: AtomicBool::new(false), busy: AtomicBool::new(false), v: UnsafeCell::new(None) }
+    }
+    /// The value, made by `f` by the first caller (the others wait for it).
+    pub fn call_once(&self, f: impl FnOnce() -> T) -> &T {
+        if let Some(v) = self.get() {
+            return v;
+        }
+        if self.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            self.set(f());
+        } else {
+            while !self.set.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+        }
+        self.get().unwrap()
     }
     pub fn set(&self, v: T) {
         unsafe { *self.v.get() = Some(v) };

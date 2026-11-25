@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 
 pub use file::{File, FileOps, FdTable};
-pub use path::{Mount, PathRef};
+pub use path::{MntNs, Mount, PathRef};
 
 pub const S_IFMT: u32 = 0o170000;
 pub const S_IFSOCK: u32 = 0o140000;
@@ -155,6 +155,11 @@ pub trait Inode: Send + Sync + Any {
     }
 
     // directories
+    /// A "magic" link of /proc (fd/N, cwd, root, exe): path walking jumps to this object instead
+    /// of resolving the link text.
+    fn magic_target(&self) -> Option<Result<path::PathRef>> {
+        None
+    }
     fn lookup(&self, name: &[u8]) -> Result<Arc<dyn Inode>> {
         Err(ENOTDIR)
     }

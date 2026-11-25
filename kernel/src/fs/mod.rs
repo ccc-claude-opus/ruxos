@@ -1,5 +1,6 @@
 //! File system types that can be mounted, and syncing them all.
 pub mod bufcache;
+pub mod cgroupfs;
 pub mod crc32c;
 pub mod ext4;
 pub mod procfs;
@@ -8,11 +9,80 @@ use crate::errno::*;
 use crate::vfs::FileSystem;
 use alloc::sync::Arc;
 
+/// "a=1,b,c=x" mount options.
+fn options(data: &[u8]) -> alloc::vec::Vec<(&[u8], &[u8])> {
+    data.split(|&c| c == b',')
+        .filter(|o| !o.is_empty())
+        .map(|o| match o.iter().position(|&c| c == b'=') {
+            Some(i) => (&o[..i], &o[i + 1..]),
+            None => (o, &b""[..]),
+        })
+        .collect()
+}
+
+fn num(v: &[u8], radix: u32) -> Result<u64> {
+    u64::from_str_radix(core::str::from_utf8(v).map_err(|_| EINVAL)?, radix).map_err(|_| EINVAL)
+}
+
+/// A size option: bytes with k/m/g suffixes, or a percentage of memory.
+fn size(v: &[u8]) -> Result<u64> {
+    let total = crate::mm::frame::TOTAL_PAGES.load(core::sync::atomic::Ordering::Relaxed) as u64 * 4096;
+    let (n, unit) = match v.last() {
+        Some(b'k' | b'K') => (&v[..v.len() - 1], 1u64 << 10),
+        Some(b'm' | b'M') => (&v[..v.len() - 1], 1 << 20),
+        Some(b'g' | b'G') => (&v[..v.len() - 1], 1 << 30),
+        Some(b'%') => return Ok(total / 100 * num(&v[..v.len() - 1], 10)?),
+        _ => (v, 1),
+    };
+    num(n, 10)?.checked_mul(unit).ok_or(EINVAL)
+}
+
+/// tmpfs(5): size=, mode=, uid=, gid= (ids in the mounter's user namespace), nr_inodes= (accepted).
+/// The root belongs to the mounter's fsuid/fsgid unless told otherwise.
+fn tmpfs(data: &[u8]) -> Result<Arc<dyn FileSystem>> {
+    let c = crate::task::current_proc().cred();
+    let (mut mode, mut uid, mut gid, mut max) = (0o1777u32, c.fsuid, c.fsgid, u64::MAX);
+    for (k, v) in options(data) {
+        match k {
+            b"size" => max = size(v)?,
+            b"mode" => mode = num(v, 8)? as u32 & 0o7777,
+            b"uid" => uid = c.user_ns.make_kuid(num(v, 10)? as u32).ok_or(EINVAL)?,
+            b"gid" => gid = c.user_ns.make_kgid(num(v, 10)? as u32).ok_or(EINVAL)?,
+            b"nr_inodes" | b"nr_blocks" | b"huge" | b"mpol" | b"inode64" | b"inode32" | b"noswap" => {}
+            _ => return Err(EINVAL),
+        }
+    }
+    if max == 0 {
+        max = u64::MAX; // size=0: no limit
+    }
+    Ok(crate::vfs::tmpfs::TmpFs::with_options("tmpfs", mode, uid, gid, max))
+}
+
+/// devpts (newinstance): the ptmx node (ptmxmode=, default 0000) and the terminals' slaves.
+fn devpts(data: &[u8]) -> Result<Arc<dyn FileSystem>> {
+    let mut ptmxmode = 0u32;
+    for (k, v) in options(data) {
+        match k {
+            b"ptmxmode" => ptmxmode = num(v, 8)? as u32 & 0o777,
+            b"newinstance" | b"mode" | b"gid" | b"uid" | b"max" => {}
+            _ => return Err(EINVAL),
+        }
+    }
+    let fs = crate::vfs::tmpfs::TmpFs::with_options("devpts", 0o755, 0, 0, u64::MAX);
+    fs.root().create(b"ptmx", crate::vfs::S_IFCHR | ptmxmode, crate::vfs::makedev(5, 2), 0, 0)?;
+    Ok(fs)
+}
+
 /// mount(2): a new instance of the file system `fstype` on `source`.
 pub fn make_fs(fstype: &[u8], _source: &[u8], _data: &[u8], _ro: bool) -> Result<Arc<dyn FileSystem>> {
     match fstype {
-        b"tmpfs" | b"ramfs" => Ok(crate::vfs::tmpfs::TmpFs::new("tmpfs", 0o1777)),
-        b"proc" => Ok(procfs::new()),
+        b"tmpfs" | b"ramfs" => tmpfs(_data),
+        b"devpts" => devpts(_data),
+        b"cgroup2" => {
+            let root = crate::task::current_proc().ns.lock().cgroup.root.clone();
+            Ok(cgroupfs::new(cgroupfs::lookup_path(&root).unwrap_or_else(crate::cgroup::root)))
+        }
+        b"proc" => Ok(procfs::new(crate::task::current_proc().pid_ns.clone())),
         b"sysfs" => Ok(sysfs::new()),
         b"devtmpfs" => Ok(crate::vfs::dev::DEVTMPFS.get().ok_or(ENODEV)?.clone()),
         b"ext4" | b"ext3" | b"ext2" => {
@@ -23,28 +93,9 @@ pub fn make_fs(fstype: &[u8], _source: &[u8], _data: &[u8], _ro: bool) -> Result
     }
 }
 
-/// Every mount of the mount tree (from init's root).
+/// Every mount of every mount namespace.
 fn all_mounts() -> alloc::vec::Vec<Arc<crate::vfs::Mount>> {
-    let mut out = alloc::vec::Vec::new();
-    let Some(init) = crate::task::INIT.get() else { return out };
-    let Some(leader) = init.leader() else { return out };
-    let Some(th) = crate::task::thread_of(&leader) else { return out };
-    let mut root = th.fs.lock().root.mnt.clone();
-    loop {
-        let parent = root.parent.lock().clone();
-        match parent {
-            Some((p, _)) => root = p,
-            None => break,
-        }
-    }
-    fn walk(m: &Arc<crate::vfs::Mount>, out: &mut alloc::vec::Vec<Arc<crate::vfs::Mount>>) {
-        out.push(m.clone());
-        for c in m.children.lock().clone() {
-            walk(&c, out);
-        }
-    }
-    walk(&root, &mut out);
-    out
+    crate::vfs::MntNs::all_mounts()
 }
 
 pub fn is_mounted(fs: &Arc<dyn FileSystem>) -> bool {

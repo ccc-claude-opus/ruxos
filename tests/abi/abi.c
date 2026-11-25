@@ -13,7 +13,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <net/if.h>
 #include <netinet/in.h>
+#include <sched.h>
+#include <sys/ioctl.h>
+#include <sys/mount.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/utsname.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -358,6 +367,161 @@ static void test_sockets(void) {
     close(l);
 }
 
+// Namespaces and seccomp. Each case runs in a child (fork) whose exit status carries the result:
+// 0 = ok, otherwise the number of the failed step.
+static int in_child(int (*f)(void)) {
+    pid_t p = fork();
+    if (p == 0) _exit(f());
+    int st = 0;
+    waitpid(p, &st, 0);
+    return st;
+}
+
+static int write_file(const char *path, const char *s) {
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return -1;
+    int r = write(fd, s, strlen(s)) == (ssize_t)strlen(s) ? 0 : -1;
+    close(fd);
+    return r;
+}
+
+// whether we run in a chroot (/ is not init's root): user namespaces are refused there (EPERM)
+static int chrooted(void) {
+    struct stat a, b;
+    if (stat("/", &a) || stat("/proc/1/root/", &b)) return 0;
+    return a.st_dev != b.st_dev || a.st_ino != b.st_ino;
+}
+
+// an unprivileged user maps itself to root in a new user namespace
+static int userns_case(void) {
+    if (chrooted()) return unshare(CLONE_NEWUSER) == -1 && errno == EPERM ? 100 : 14;
+    if (setgid(65534) || setuid(65534)) return 1;
+    // changing ids made us non-dumpable (/proc/self owned by root); we may say otherwise
+    if (prctl(PR_GET_DUMPABLE) != 0) return 13;
+    prctl(PR_SET_DUMPABLE, 1);
+    if (unshare(CLONE_NEWUSER)) return 2;
+    if (write_file("/proc/self/setgroups", "deny")) return 3;
+    if (write_file("/proc/self/uid_map", "0 65534 1")) return 4;
+    if (write_file("/proc/self/gid_map", "0 65534 1")) return 5;
+    if (getuid() != 0 || getgid() != 0) return 6;
+    // mapping again is refused; mapping another id was never allowed
+    if (write_file("/proc/self/uid_map", "1 65534 1") == 0) return 7;
+    // root here, but files of the initial namespace's root show as the overflow id
+    struct stat st;
+    if (stat("/", &st) || st.st_uid != 65534) return 8;
+    // a mount namespace of our own: a tmpfs only we see
+    if (unshare(CLONE_NEWNS)) return 9;
+    if (mount("none", "/tmp", "tmpfs", 0, "size=1m")) return 10;
+    if (write_file("/proc/self/uid_map", "0 0 1") == 0) return 11;
+    // not allowed to mount a block file system, nor to change a flag the parent namespace locked
+    if (mount("/dev/vda", "/mnt", "ext4", 0, 0) == 0) return 12;
+    return 0;
+}
+
+static int pidns_child(void) { return getpid() == 1 && getppid() == 0 ? 0 : 20; }
+
+static int pidns_case(void) {
+    if (unshare(CLONE_NEWPID)) return 1;
+    pid_t p = fork();
+    if (p == 0) _exit(pidns_child());
+    if (p <= 1) return 2;
+    int st;
+    if (waitpid(p, &st, 0) != p) return 3;
+    if (!WIFEXITED(st)) return 4;
+    return WEXITSTATUS(st);
+}
+
+static int utsns_case(void) {
+    if (unshare(CLONE_NEWUTS)) return 1;
+    if (sethostname("abi-test", 8)) return 2;
+    struct utsname u;
+    uname(&u);
+    return strcmp(u.nodename, "abi-test") == 0 ? 0 : 3;
+}
+
+static int netns_case(void) {
+    if (unshare(CLONE_NEWNET)) return 1;
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    // lo is down in a new namespace
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    sa.sin_port = htons(9);
+    if (connect(c, (struct sockaddr *)&sa, sizeof sa) == 0 || errno != ENETUNREACH) return 2;
+    close(c);
+    struct ifreq ifr = {0};
+    strcpy(ifr.ifr_name, "lo");
+    if (ioctl(l, SIOCGIFFLAGS, &ifr)) return 3;
+    ifr.ifr_flags |= IFF_UP;
+    if (ioctl(l, SIOCSIFFLAGS, &ifr)) return 4;
+    sa.sin_port = 0;
+    socklen_t len = sizeof sa;
+    if (bind(l, (struct sockaddr *)&sa, sizeof sa) || listen(l, 1) || getsockname(l, (struct sockaddr *)&sa, &len)) return 5;
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    if (connect(c, (struct sockaddr *)&sa, sizeof sa)) return 6;
+    // only lo here
+    if (if_nametoindex("eth0") != 0) return 7;
+    return 0;
+}
+
+static int seccomp_errno_case(void) {
+    struct sock_filter f[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0), // nr
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getppid, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog prog = {4, f};
+    // without no_new_privs or CAP_SYS_ADMIN this is refused; root may
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) return 1;
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)) return 2;
+    if (prctl(PR_GET_SECCOMP) != 2) return 3;
+    errno = 0;
+    if (syscall(SYS_getppid) != -1 || errno != EPERM) return 4;
+    if (getpid() <= 0) return 5;
+    // a broken program is refused
+    struct sock_filter bad[] = {BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 1)};
+    struct sock_fprog bp = {1, bad};
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &bp) == 0 || errno != EINVAL) return 6;
+    // the filter survives fork
+    pid_t c = fork();
+    if (c == 0) _exit(syscall(SYS_getppid) == -1 ? 0 : 1);
+    int st;
+    waitpid(c, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 7;
+}
+
+static int seccomp_kill_case(void) {
+    struct sock_filter f[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getppid, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog prog = {4, f};
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog)) return 1;
+    syscall(SYS_getppid);
+    return 2; // not reached
+}
+
+static void test_namespaces(void) {
+    int st = in_child(userns_case);
+    // 100: in a chroot, where the kernel rightly refuses (the rest is checked outside it)
+    CHECK("userns-map-mount", WIFEXITED(st) && (WEXITSTATUS(st) == 0 || WEXITSTATUS(st) == 100), "status %#x", st);
+    st = in_child(pidns_case);
+    CHECK("pidns-pid1", WIFEXITED(st) && WEXITSTATUS(st) == 0, "status %#x", st);
+    st = in_child(utsns_case);
+    struct utsname u;
+    uname(&u);
+    CHECK("utsns-hostname", WIFEXITED(st) && WEXITSTATUS(st) == 0 && strcmp(u.nodename, "abi-test") != 0, "status %#x, host %s", st, u.nodename);
+    st = in_child(netns_case);
+    CHECK("netns-lo", WIFEXITED(st) && WEXITSTATUS(st) == 0, "status %#x", st);
+    st = in_child(seccomp_errno_case);
+    CHECK("seccomp-errno", WIFEXITED(st) && WEXITSTATUS(st) == 0, "status %#x", st);
+    st = in_child(seccomp_kill_case);
+    CHECK("seccomp-kill", WIFSIGNALED(st) && WTERMSIG(st) == SIGSYS, "status %#x", st);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "child-exec") == 0) return 42;
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -367,6 +531,7 @@ int main(int argc, char **argv) {
     test_time();
     test_files();
     test_sockets();
+    test_namespaces();
     pid_t pid = fork();
     if (pid == 0) {
         execl(argv[0], argv[0], "child-exec", (char *)NULL);

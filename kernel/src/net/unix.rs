@@ -55,6 +55,8 @@ pub struct UnixSocket {
     bound_inode: SpinLock<Option<usize>>,
     sndbuf: AtomicU32,
     rcvbuf: AtomicU32,
+    /// the network namespace (its abstract names)
+    net: u64,
 }
 
 /// Every unix socket, for the Ctrl-T dump (ruxos.debug only).
@@ -91,7 +93,8 @@ pub fn dump() {
 }
 
 static BY_INODE: SpinLock<BTreeMap<usize, Weak<UnixSocket>>> = SpinLock::new(BTreeMap::new());
-static ABSTRACT: SpinLock<BTreeMap<Vec<u8>, Weak<UnixSocket>>> = SpinLock::new(BTreeMap::new());
+/// Abstract names, per network namespace (namespace inode, name).
+static ABSTRACT: SpinLock<BTreeMap<(u64, Vec<u8>), Weak<UnixSocket>>> = SpinLock::new(BTreeMap::new());
 
 fn my_cred() -> (u32, u32, u32) {
     match crate::task::try_current_thread() {
@@ -158,6 +161,7 @@ impl UnixSocket {
             bound_inode: SpinLock::new(None),
             sndbuf: AtomicU32::new(CAPACITY as u32),
             rcvbuf: AtomicU32::new(CAPACITY as u32),
+            net: crate::ns::cur_net().ino,
         });
         if crate::kernel_param("ruxos.debug").is_some() {
             let mut a = ALL.lock();
@@ -210,8 +214,8 @@ impl UnixSocket {
             let n = crate::random::u64() & 0xfffff;
             let name = alloc::format!("\0{:05x}", n).into_bytes();
             let mut a = ABSTRACT.lock();
-            if a.get(&name).and_then(|w| w.upgrade()).is_none() {
-                a.insert(name.clone(), self.me.clone());
+            if a.get(&(self.net, name.clone())).and_then(|w| w.upgrade()).is_none() {
+                a.insert((self.net, name.clone()), self.me.clone());
                 *l = Some(name);
                 return;
             }
@@ -221,7 +225,7 @@ impl UnixSocket {
     /// Finds the socket bound to `name`.
     fn lookup(name: &[u8]) -> Result<Arc<UnixSocket>> {
         if name.first() == Some(&0) {
-            return ABSTRACT.lock().get(name).and_then(|w| w.upgrade()).ok_or(ECONNREFUSED);
+            return ABSTRACT.lock().get(&(crate::ns::cur_net().ino, name.to_vec())).and_then(|w| w.upgrade()).ok_or(ECONNREFUSED);
         }
         let p = crate::syscall::fs::lookup_at(-100, name, true, false)?;
         let i = p.inode()?;
@@ -262,8 +266,9 @@ impl Drop for UnixSocket {
         if let Some(n) = self.local.lock().take() {
             if n.first() == Some(&0) {
                 let mut a = ABSTRACT.lock();
-                if a.get(&n).is_some_and(|w| w.strong_count() == 0) {
-                    a.remove(&n);
+                let k = (self.net, n);
+                if a.get(&k).is_some_and(|w| w.strong_count() == 0) {
+                    a.remove(&k);
                 }
             }
         }
@@ -290,10 +295,10 @@ impl Socket for UnixSocket {
         }
         if name[0] == 0 {
             let mut a = ABSTRACT.lock();
-            if a.get(&name).and_then(|w| w.upgrade()).is_some() {
+            if a.get(&(self.net, name.clone())).and_then(|w| w.upgrade()).is_some() {
                 return Err(EADDRINUSE);
             }
-            a.insert(name.clone(), self.me.clone());
+            a.insert((self.net, name.clone()), self.me.clone());
         } else {
             // a socket node in the file system
             let th = crate::task::current_thread();
@@ -301,7 +306,7 @@ impl Socket for UnixSocket {
             let c = crate::syscall::fs::cred();
             let r = th.fs.lock().root.clone();
             let st = crate::syscall::fs::start(-100)?;
-            let (dir, last, _) = crate::vfs::path::Lookup { root: &r, cred: &c, follow_last: true, beneath: false, no_symlinks: false }.resolve_parent(&st, &name)?;
+            let (dir, last, _) = crate::vfs::path::Lookup { root: &r, cred: &c, follow_last: true, beneath: false, no_symlinks: false, no_magiclinks: false, no_xdev: false }.resolve_parent(&st, &name)?;
             let di = dir.inode()?;
             if dir.d.child(&last)?.inode.lock().is_some() {
                 return Err(EADDRINUSE);
@@ -640,7 +645,7 @@ impl Socket for UnixSocket {
             SO_PASSCRED => i(self.passcred.load(Ordering::Relaxed) as i32),
             SO_ACCEPTCONN => i(matches!(&*self.conn.lock(), Conn::Listening { .. }) as i32),
             SO_PEERCRED => {
-                let (p, u, g) = *self.peer_cred.lock();
+                let (p, u, g) = crate::task::view_creds(*self.peer_cred.lock());
                 let mut v = Vec::new();
                 v.extend_from_slice(&p.to_le_bytes());
                 v.extend_from_slice(&u.to_le_bytes());

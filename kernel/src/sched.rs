@@ -169,6 +169,36 @@ pub fn wake(t: &Arc<Task>) -> bool {
     }
 }
 
+/// cpu.max: how long `t` must wait for its cgroup's next period (None: it may run).
+fn throttle_wait(t: &Task) -> Option<u64> {
+    crate::task::thread_of(t).and_then(|th| crate::cgroup::throttled(&th.proc))
+}
+
+/// The first task of the queue whose cgroups have CPU time left; throttled ones keep their place,
+/// and the CPU's timer is set for when they may run again.
+fn pick_unthrottled(pc: &percpu::PerCpu, rq: &mut alloc::collections::VecDeque<Arc<Task>>) -> Option<Arc<Task>> {
+    if crate::cgroup::CPU_LIMITED.load(Ordering::Relaxed) == 0 {
+        return rq.pop_front();
+    }
+    let mut wake: Option<u64> = None;
+    for i in 0..rq.len() {
+        match throttle_wait(&rq[i]) {
+            None => {
+                let t = rq.remove(i);
+                if let Some(w) = wake {
+                    crate::time::throttle_timer(pc, w);
+                }
+                return t;
+            }
+            Some(w) => wake = Some(wake.map_or(w, |x| x.min(w))),
+        }
+    }
+    if let Some(w) = wake {
+        crate::time::throttle_timer(pc, w);
+    }
+    None
+}
+
 fn steal(me: usize) -> Option<Arc<Task>> {
     let n = percpu::ncpus();
     for k in 1..n {
@@ -190,16 +220,32 @@ pub fn schedule() {
     let pc = percpu::this();
     let cur = unsafe { (*pc.current.get()).clone().unwrap() };
     pc.need_resched.store(false, Ordering::Relaxed);
+    // CPU time of the task that ran (cgroup cpu accounting and cpu.max)
+    if !cur.is_idle {
+        let now = arch::ticks();
+        let ran = now.saturating_sub(pc.run_start.swap(now, Ordering::Relaxed));
+        if let Some(th) = crate::task::thread_of(&cur) {
+            crate::cgroup::charge_cpu(&th.proc, crate::time::ticks_to_ns(ran));
+        }
+    }
     let next = {
         let mut rq = pc.rq.lock();
         if !cur.is_idle && cur.state.load(Ordering::Relaxed) == RUNNING {
             cur.state.store(RUNNABLE, Ordering::Relaxed);
             rq.push_back(cur.clone());
         }
-        rq.pop_front()
+        pick_unthrottled(pc, &mut rq)
     };
     let next = next
-        .or_else(|| steal(pc.id))
+        .or_else(|| steal(pc.id).and_then(|t| {
+            // a stolen task over its cgroup's quota waits in our queue instead
+            if throttle_wait(&t).is_some() {
+                pc.rq.lock().push_back(t);
+                None
+            } else {
+                Some(t)
+            }
+        }))
         .unwrap_or_else(|| unsafe { (*pc.idle_task.get()).clone().unwrap() });
     if Arc::ptr_eq(&next, &cur) {
         cur.state.store(RUNNING, Ordering::Relaxed);
@@ -245,6 +291,7 @@ fn finish_switch() {
         p.on_cpu.store(false, Ordering::Release);
         drop(p);
     }
+    percpu::this().run_start.store(arch::ticks(), Ordering::Relaxed);
     crate::time::start_slice();
 }
 

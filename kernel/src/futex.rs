@@ -258,7 +258,8 @@ pub fn exit_robust_list(head: usize) {
     if head == 0 {
         return;
     }
-    let tid = sched::current().tid;
+    // user space stores the tid it sees (in its PID namespace)
+    let tid = crate::task::vpid(sched::current().tid);
     let Ok([mut entry, offset, pending]) = vm::read_user::<[usize; 3]>(head) else { return };
     let handle = |e: usize| {
         let uaddr = e.wrapping_add(offset);

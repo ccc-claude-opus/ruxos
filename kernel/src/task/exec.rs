@@ -77,7 +77,7 @@ fn open_exec(path: &[u8], at: &PathRef) -> Result<(PathRef, Arc<dyn Inode>)> {
     let th = current_thread();
     let cred = th.proc.cred();
     let root = th.fs.lock().root.clone();
-    let lk = Lookup { root: &root, cred: &cred, follow_last: true, beneath: false, no_symlinks: false };
+    let lk = Lookup { root: &root, cred: &cred, follow_last: true, beneath: false, no_symlinks: false, no_magiclinks: false, no_xdev: false };
     let p = lk.resolve(at, path)?;
     let inode = p.inode()?;
     if inode.stat()?.mode & S_IFMT != S_IFREG {
@@ -249,7 +249,25 @@ pub fn execve(path: &[u8], argv: Vec<Vec<u8>>, envp: Vec<Vec<u8>>, at: &PathRef,
     // ---- point of no return: a new address space
     let th = current_thread();
     de_thread();
+    // capabilities across execve (capabilities(7); no file capabilities or set-user-id files here)
+    {
+        let mut c = th.proc.cred.lock();
+        let root = c.user_ns.make_kuid(0);
+        if root.is_some() && (Some(c.uid) == root || Some(c.euid) == root) {
+            c.cap_perm = (c.cap_inh | c.cap_bnd) & super::CAP_ALL;
+            c.cap_amb = 0;
+            c.cap_eff = if Some(c.euid) == root { c.cap_perm } else { 0 };
+        } else {
+            c.cap_perm = c.cap_amb;
+            c.cap_eff = c.cap_amb;
+        }
+        c.keepcaps = false;
+        // dumpable again unless the ids differ (begin_new_exec)
+        let dump = c.euid == c.uid && c.egid == c.gid;
+        th.proc.dumpable.store(dump as u32, Ordering::Relaxed);
+    }
     let mm = Mm::new();
+    mm.set_memcg(Some(crate::cgroup::of(&th.proc)));
     let stack_lim = th.proc.rlimit(super::RLIMIT_STACK).0.min(1 << 30).max(128 << 10) as usize;
     let stack_top = arch::USER_TOP - PAGE_SIZE;
     {

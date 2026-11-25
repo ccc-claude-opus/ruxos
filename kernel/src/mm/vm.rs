@@ -68,6 +68,9 @@ pub struct Mm {
     pub inner: Mutex<MmInner>,
     /// CPUs that have this address space loaded (or had: their TLB may hold its entries).
     pub cpus: AtomicUsize,
+    /// pages mapped (resident), charged to `memcg` (the memory controller of cgroup v2)
+    pub rss: core::sync::atomic::AtomicU64,
+    pub memcg: crate::sync::SpinLock<Option<Arc<crate::cgroup::Cgroup>>>,
 }
 
 static NEXT_ASID: AtomicUsize = AtomicUsize::new(1);
@@ -119,7 +122,45 @@ impl Mm {
                 exe: None,
             }),
             cpus: AtomicUsize::new(0),
+            rss: core::sync::atomic::AtomicU64::new(0),
+            memcg: crate::sync::SpinLock::new(None),
         })
+    }
+
+    pub fn rss_pages(&self) -> u64 {
+        self.rss.load(Ordering::Relaxed)
+    }
+
+    /// One more resident page; fails (ENOMEM) when the cgroup's memory.max would be exceeded.
+    fn charge_page(&self) -> Result<()> {
+        if let Some(cg) = self.memcg.lock().as_ref() {
+            crate::cgroup::charge_mem(cg, PAGE_SIZE as u64)?;
+        }
+        self.rss.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn uncharge_pages(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let _ = self.rss.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(n)));
+        if let Some(cg) = self.memcg.lock().as_ref() {
+            crate::cgroup::uncharge_mem(cg, n * PAGE_SIZE as u64);
+        }
+    }
+
+    /// The pages of this address space count for `cg` from now on.
+    pub fn set_memcg(&self, cg: Option<Arc<crate::cgroup::Cgroup>>) {
+        let bytes = self.rss_pages() * PAGE_SIZE as u64;
+        let mut m = self.memcg.lock();
+        if let Some(old) = m.as_ref() {
+            crate::cgroup::uncharge_mem(old, bytes);
+        }
+        if let Some(new) = cg.as_ref() {
+            crate::cgroup::force_charge_mem(new, bytes);
+        }
+        *m = cg;
     }
 
     /// The leaf entry for `va`, creating intermediate tables when `create`.
@@ -146,6 +187,7 @@ impl Mm {
     pub fn unmap_pages(&self, start: usize, end: usize) {
         let mut va = start;
         let mut any = false;
+        let mut removed = 0u64;
         while va < end {
             // skip missing tables quickly
             let mut t = self.root;
@@ -166,6 +208,7 @@ impl Mm {
             if arch::pte_valid(*e) {
                 let pa = arch::pte_pa(*e);
                 *e = 0;
+                removed += 1;
                 if (end - start) / PAGE_SIZE <= 32 {
                     self.flush(va);
                 } else {
@@ -178,6 +221,7 @@ impl Mm {
         if any {
             arch::tlb_flush_asid(self.asid);
         }
+        self.uncharge_pages(removed);
     }
 
     /// Recomputes the protection of the present pages of [start, end).
@@ -272,15 +316,25 @@ impl Mm {
             return Ok(());
         }
         let vma = vma.clone();
+        self.charge_page()?;
         let pa = match &vma.file {
             None => {
-                let pa = frame::try_zeroed_page().ok_or(ENOMEM)?;
+                let Some(pa) = frame::try_zeroed_page() else {
+                    self.uncharge_pages(1);
+                    return Err(ENOMEM);
+                };
                 *e = arch::pte_user(pa, true, writable, exec);
                 pa
             }
             Some(f) => {
                 let idx = file_index(&vma, page_va);
-                let cache = f.get_page(idx)?; // a reference for us
+                let cache = match f.get_page(idx) {
+                    Ok(c) => c, // a reference for us
+                    Err(e) => {
+                        self.uncharge_pages(1);
+                        return Err(e);
+                    }
+                };
                 if vma.shared {
                     if access == Access::Write {
                         f.page_mkwrite(idx);
@@ -365,6 +419,7 @@ impl Mm {
                             *e
                         };
                         *child.pte(va, true).ok_or(ENOMEM)? = ne;
+                        child.rss.fetch_add(1, Ordering::Relaxed);
                     }
                 } else {
                     // no table for this range: skip to the next leaf table
@@ -387,6 +442,12 @@ impl Mm {
             arch::tlb_flush_asid(self.asid);
         }
         drop(ci);
+        // the child's pages count for the same cgroup
+        let cg = self.memcg.lock().clone();
+        if let Some(cg) = &cg {
+            crate::cgroup::charge_mem(cg, child.rss_pages() * PAGE_SIZE as u64)?;
+        }
+        *child.memcg.lock() = cg;
         Ok(child)
     }
 }
@@ -401,6 +462,8 @@ pub fn find_vma(vmas: &BTreeMap<usize, Vma>, va: usize) -> Option<&Vma> {
 
 impl Drop for Mm {
     fn drop(&mut self) {
+        let n = self.rss_pages();
+        self.uncharge_pages(n);
         // free every page and table
         fn free(t: usize, level: usize) {
             let tb = table(t);
